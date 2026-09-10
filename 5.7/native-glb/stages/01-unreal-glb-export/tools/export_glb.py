@@ -189,6 +189,16 @@ def _export_arkit_shape_sources(face_skm, out_dir):
     pa_path = "/MetaHumanCharacter/Face/ARKit/PA_MetaHuman_ARKit_Mapping"
     as_path = "/MetaHumanCharacter/Face/ARKit/AS_MetaHuman_ARKit_Mapping"
 
+    # Like the groom-atlas plugin content below, the MH plugin's ARKit
+    # folder isn't auto-indexed at editor startup (lazy-loaded "Optional"
+    # content) — load_asset silently fails ("could not be found in the
+    # Asset Registry") unless we force a scan first.
+    ar = unreal.AssetRegistryHelpers.get_asset_registry()
+    try:
+        ar.scan_paths_synchronous(["/MetaHumanCharacter/Face/ARKit"], force_rescan=False)
+    except Exception as e:
+        _log(f"  scan /MetaHumanCharacter/Face/ARKit failed: {e}")
+
     pa = unreal.EditorAssetLibrary.load_asset(pa_path)
     a_seq = unreal.EditorAssetLibrary.load_asset(as_path)
     if pa is None or a_seq is None:
@@ -593,7 +603,13 @@ def main():
 
     char_root = os.path.join(workspace, "characters", args.char)
     char_manifest = json.load(open(os.path.join(char_root, "manifest.json"), encoding="utf-8"))
-    mh_folder = char_manifest["mh_folder"]
+    # Stage 00 records where the build actually landed assets as
+    # `ue_content_root` (the MH plugin's build convention varies by UE
+    # version — e.g. UE 5.8's Cinematic pipeline uses /Game/Unpacked/<Name>/
+    # rather than /Game/<Name>/). Fall back to mh_folder for older
+    # character manifests written before stage 00 recorded this.
+    mh_folder = char_manifest.get("ue_content_root") or char_manifest["mh_folder"]
+    _log(f"content root: {mh_folder}")
 
     out_dir = _ensure_dir(os.path.join(char_root, "01-glb"))
     textures_dir = _ensure_dir(os.path.join(out_dir, "textures"))
@@ -626,7 +642,7 @@ def main():
             f"AssetRegistry returned incomplete SkeletalMesh list under "
             f"{mh_folder}: {skm_names} (face={have_face}, body={have_body}). "
             f"Both FaceMesh and BodyMesh are required for a MetaHuman. "
-            f"Re-run stage 00 to refresh /Game/<char>/, or check that the "
+            f"Re-run stage 00 to refresh {mh_folder}, or check that the "
             f"MetaHuman build actually completed and emitted a body mesh.")
 
     # StaticMeshes — groom card fallbacks under /Game/<Name>/Grooms/.
@@ -711,7 +727,7 @@ def main():
         cls = str(getattr(a, "asset_class_path", a).asset_name)
         if cls == "GroomAsset":
             groom_styles.append(str(a.asset_name))
-    _log(f"  sidecar: groom styles in /Game/{args.char}/Grooms: {groom_styles}")
+    _log(f"  sidecar: groom styles in {mh_folder}/Grooms: {groom_styles}")
 
     # Force-index the plugin content roots that hold the card atlases.
     # They aren't auto-indexed at editor startup (the MetaHuman plugin

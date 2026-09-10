@@ -49,8 +49,16 @@ Python environment. The script:
 5. `build_meta_human(character, params)` with
    `pipeline_type = Cinematic` (UE 5.6 MH plugin only exposes Cinematic
    + DCC; Optimized landed in 5.7).
-6. Save `/Game/<Name>/` so the resulting SkeletalMesh assets persist
-   on disk for stage 01.
+6. Save the assembled content so the resulting SkeletalMesh assets
+   persist on disk for stage 01. **The MH plugin's build convention for
+   where assets land varies by UE version** — it is not reliably
+   `/Game/<Name>/`. As of UE 5.8, the Cinematic/Optimized pipeline
+   materializes assets under `/Game/Unpacked/<Name>/` instead. The
+   script derives the real root from the SkeletalMesh assets that
+   actually appeared (diffing the asset registry before/after the
+   build) and writes it to the character manifest as a top-level
+   `ue_content_root` field — stage 01 reads that instead of assuming a
+   fixed path.
 7. Reference screenshot: spawn the assembled face / body / outfits /
    groom-card actors in the editor world, point the perspective
    viewport at the head, fire `HighResShot 1024x1024`, and copy the
@@ -76,7 +84,7 @@ the UE log.
 
 | Artifact | Location | Notes |
 |---|---|---|
-| SkeletalMesh assets | `<UE project>/Content/<Name>/Body\|Face\|Clothing\|Grooms/` | Saved in-engine |
+| SkeletalMesh assets | `<UE project>/Content/<Name>/Body\|Face\|Clothing\|Grooms/` (or `Content/Unpacked/<Name>/...` on UE 5.8+ — see `ue_content_root` in the character manifest for the actual path) | Saved in-engine |
 | Thumbnail (pre-build) | `characters/<id>/source/thumbnail.jpg` | JPEG extracted from the .uasset Content Browser thumbnail. Operator review gate before the build. |
 | Reference screenshot | `characters/<id>/source/reference.png` | 1024x1024 UE-rendered headshot of the assembled MH. Ground truth for downstream visual diffing. |
 | Status JSON | (transient) | `C:/tmp/mh/status.json` |

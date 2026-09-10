@@ -27,22 +27,30 @@ commandlet locks the project file).
 | Source | File / Location | Section | Why |
 |---|---|---|---|
 | Workspace config | `_config/pipeline.yaml` | `ue_by_version.5.7`, `glb_constraints` | UE project + editor exe paths, max texture size |
-| Character manifest | `characters/<id>/manifest.json` | `character_id`, `output_name` (or fallback to `<id>`) | Identify the character + UE folder. DO NOT read or modify other stages' status fields. |
+| Character manifest | `characters/<id>/manifest.json` | `character_id`, `output_name`, `ue_content_root` (falls back to `/Game/<output_name>/` if absent) | Identify the character + UE content folder. DO NOT read or modify other stages' status fields. |
 | Character source | `characters/<id>/source/README.md` | all | Human-readable context only |
 | Engine asset | `/MetaHumanCharacter/Face/ARKit/AS_MetaHuman_ARKit_Mapping` | full | Source AnimSequence (24fps, 66 keyframes, 1-per-pose) — the curve-driven ARKit mapping |
 | Engine asset | `/MetaHumanCharacter/Face/ARKit/PA_MetaHuman_ARKit_Mapping` | pose names | PoseAsset whose names define the ARKit pose order Stage 02 expects |
 
 ## Preconditions (UE-side, not manifest)
 
-Verify the UE project has `/Game/<output_name>/` containing assembled
+Determine the content root: read `ue_content_root` from
+`characters/<id>/manifest.json` (a top-level field, written by stage 00
+after it detects where the build actually landed assets — the MH
+plugin's convention varies by UE version, e.g. `/Game/Unpacked/<Name>/`
+on UE 5.8 vs. `/Game/<Name>/` on earlier versions). Fall back to
+`/Game/<output_name>/` only if `ue_content_root` is absent (older
+character manifests).
+
+Verify the UE project has that folder on disk, containing assembled
 MetaHuman assets (face + body SkeletalMesh, hair-card StaticMeshes).
 This is what stage 00 produces. Do **not** read the manifest's
 `stages.00_unreal_assemble.status` field — it can be stale; the
 project state on disk is ground truth.
 
-If `/Game/<output_name>/` is missing, abort with an actionable message
-("UE assets not found at /Game/<output_name>/ — run stage 00 first").
-Do not "fix" any manifest field.
+If the content-root folder is missing, abort with an actionable message
+("UE assets not found at <content_root> — run stage 00 first"). Do not
+"fix" any manifest field.
 
 ## Process
 
@@ -113,7 +121,8 @@ referenced assets). It's harmless and overwrites cleanly on next run.
 
 ## Failure modes (known)
 
-- `/Game/<output_name>/` missing → stage 00 not done. Fail with actionable msg.
+- Content-root folder (`ue_content_root`, or `/Game/<output_name>/` as
+  fallback) missing → stage 00 not done. Fail with actionable msg.
 - UE editor running → project locked. Fail early, ask user to close editor.
 - `LS_arkit_full.fbx` not produced → check log for `MeshObject`
   assertion. Means `-AllowCommandletRendering` was missing on the UE

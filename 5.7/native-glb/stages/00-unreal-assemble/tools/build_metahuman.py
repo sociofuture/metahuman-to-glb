@@ -76,6 +76,47 @@ def list_skel() -> set[str]:
     return out
 
 
+def _derive_content_root(assets: list) -> str | None:
+    """Given `list_skel()`-style 'pkg.name' entries, return the common
+    folder two levels above each asset (i.e. above its Body/Face/
+    Clothing/Grooms category folder). Returns None if the assets don't
+    share a single root, so callers can fail loud instead of guessing.
+
+    Exists because the MH plugin's Cinematic/Optimized build doesn't
+    reliably land assets at /Game/<output_name>/ — as of UE 5.8 it
+    materializes them under /Game/Unpacked/<Name>/ instead. Deriving
+    the root from where assets actually landed (rather than assuming a
+    fixed convention) keeps this working across plugin versions."""
+    roots = set()
+    for entry in assets:
+        pkg = entry.split(".", 1)[0]
+        parts = pkg.rsplit("/", 2)
+        if len(parts) == 3:
+            roots.add(parts[0])
+    if len(roots) == 1:
+        return roots.pop()
+    return None
+
+
+def _write_content_root_to_manifest(char_id: str, content_root: str) -> None:
+    """Persist the detected /Game content root as a top-level character
+    fact (alongside mh_folder/output_name) so stage 01 doesn't have to
+    re-derive it. Best-effort: stage 01 falls back to /Game/<output_name>/
+    if this is absent, so a failure here doesn't fail the build."""
+    workspace = STATE.get("workspace")
+    if not workspace:
+        log("  no MH_PIPELINE_WORKSPACE set; skipping char-manifest content_root write")
+        return
+    manifest_path = Path(workspace) / "characters" / char_id / "manifest.json"
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        data["ue_content_root"] = content_root
+        manifest_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        log(f"  wrote ue_content_root={content_root} to {manifest_path}")
+    except Exception as e:
+        log(f"  could not write ue_content_root to character manifest: {e}")
+
+
 def _take_reference_screenshot(char_name: str) -> bool:
     """Queue a head-and-shoulders reference render of the assembled
     MetaHuman from the editor's perspective viewport.
@@ -464,11 +505,19 @@ def on_tick(dt: float) -> None:
                 # to pipeline_quality, no force-deletes, no plugin asset
                 # mutations. The 1024 web ceiling is enforced downstream
                 # in the GLB export stage, not here.
-                pipeline_enum = {
-                    "cinematic": unreal.MetaHumanDefaultPipelineType.CINEMATIC,
-                    "optimized": unreal.MetaHumanDefaultPipelineType.OPTIMIZED,
-                    "dcc":       unreal.MetaHumanDefaultPipelineType.DCC,
-                }[STATE["pipeline"].lower()]
+                # Look up only the requested enum member. A dict literal
+                # would evaluate all three at once, and DCC no longer
+                # exists on the MH plugin as of UE 5.7 — referencing it
+                # unconditionally crashes cinematic/optimized builds too.
+                pipeline_key = STATE["pipeline"].lower()
+                if pipeline_key == "cinematic":
+                    pipeline_enum = unreal.MetaHumanDefaultPipelineType.CINEMATIC
+                elif pipeline_key == "optimized":
+                    pipeline_enum = unreal.MetaHumanDefaultPipelineType.OPTIMIZED
+                elif pipeline_key == "dcc":
+                    pipeline_enum = unreal.MetaHumanDefaultPipelineType.DCC
+                else:
+                    raise ValueError(f"unknown pipeline type: {STATE['pipeline']!r}")
                 set_if(["pipeline_type", "PipelineType"], pipeline_enum)
 
                 if STATE["pipeline"].lower() == "dcc":
@@ -507,13 +556,22 @@ def on_tick(dt: float) -> None:
                 log(f"build complete; {len(new_assets)} new SkeletalMesh asset(s) in /Game")
                 for a in new_assets[:20]:
                     log(f"  + {a}")
-                write_status("SAVING", produced=new_assets)
-                game_folder = f"/Game/{STATE['output_name']}"
+                content_root = _derive_content_root(new_assets)
+                if content_root is None:
+                    log(f"  WARNING: new assets don't share a common root; "
+                        f"falling back to /Game/{STATE['output_name']}")
+                    content_root = f"/Game/{STATE['output_name']}"
+                else:
+                    log(f"  content_root detected: {content_root}")
+                STATE["content_root"] = content_root
+                _write_content_root_to_manifest(STATE["output_name"], content_root)
+
+                write_status("SAVING", produced=new_assets, content_root=content_root)
                 try:
                     unreal.EditorAssetLibrary.save_directory(
-                        game_folder, only_if_is_dirty=False, recursive=True)
+                        content_root, only_if_is_dirty=False, recursive=True)
                 except Exception as e:
-                    log(f"  save_directory({game_folder}) warning: {e}")
+                    log(f"  save_directory({content_root}) warning: {e}")
                 unreal.EditorAssetLibrary.save_loaded_asset(character)
 
                 # Reference screenshot — TODO: integrate after the
@@ -532,7 +590,8 @@ def on_tick(dt: float) -> None:
                              output_dir=str(STATE["output_dir"]),
                              fbx=exported["meshes"],
                              textures=exported["textures"],
-                             mh_manifest=exported["manifest_path"])
+                             mh_manifest=exported["manifest_path"],
+                             content_root=content_root)
             STATE["finished"] = True
             # Quit the editor so the launcher's process actually terminates.
             # Without this, UE idles forever after the build completes and
