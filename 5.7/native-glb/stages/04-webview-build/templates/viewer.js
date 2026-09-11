@@ -114,6 +114,16 @@ export async function mount(container, opts) {
   const pmrem = new THREE.PMREMGenerator(renderer);
   scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
 
+  // Key light: the RoomEnvironment above is pure soft ambient/IBL — with
+  // no directional source, fine surface relief (skin pores, wrinkles from
+  // the face's normal map) never falls into shadow and reads as flat
+  // regardless of how much detail the texture actually has. A single
+  // raking-angle key light (classic ~45°-above-camera portrait position)
+  // is enough to reveal that relief without moving to a full 3-point rig.
+  const keyLight = new THREE.DirectionalLight(0xfff4e8, 2.2);
+  keyLight.position.set(1.3, 1.6, 2.0);
+  scene.add(keyLight);
+
   const controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
@@ -153,9 +163,14 @@ export async function mount(container, opts) {
   // Resolve per-character hair overrides before patching materials.
   const charId = _resolveCharacterId(opts);
   const rawOverride = charId ? (HAIR_OVERRIDES[charId] || null) : null;
-  if (rawOverride && rawOverride.global) {
-    // Full format: { global: {...}, materials: {...} }
-    _activeHairOverrides = rawOverride.global;
+  if (rawOverride && ('global' in rawOverride || 'materials' in rawOverride)) {
+    // Full format: { global: {...}, materials: {...} }. Either key is
+    // optional (e.g. a materials-only entry with no global tuning) —
+    // checking for `global` alone here used to silently misclassify
+    // a materials-only entry as "legacy flat format" and discard its
+    // `materials` block entirely (density/mode/color overrides never
+    // applied, no error, no log — just silently back to defaults).
+    _activeHairOverrides = rawOverride.global || null;
     _activeHairMaterials = rawOverride.materials || null;
   } else {
     // Legacy flat format or null
@@ -686,6 +701,17 @@ function applyHair(mat, p, t, loadTex) {
   const seedAmp  = typeof p.seed_variation === 'number' ? p.seed_variation : 0.36;
   const roughFloor = typeof p.hair_roughness_floor === 'number' ? p.hair_roughness_floor : 0.55;
   const roughSeedAmp = typeof p.hair_roughness_seed_amp === 'number' ? p.hair_roughness_seed_amp : 0.08;
+  // Fraction of strands to render white/gray (MH's `WhiteAmount` groom
+  // param). Applied per-strand below using the atlas's seed channel as
+  // a random draw per card, rather than flattening every strand toward
+  // gray — that reproduces graying hair's actual salt-and-pepper look
+  // instead of a uniformly washed-out color.
+  // Scaled down from the raw MH scalar: treating WhiteAmount as a literal
+  // 1:1 fraction of pure-white strands read as too white/blown-out on
+  // screen (specular + AO make bright strands pop more than a matching
+  // fraction of dark strands recedes). 0.55x plus a darker gray target
+  // below is a tuned-by-eye compromise, not a physical MH shader match.
+  const whiteAmount = (typeof p.white_amount === 'number' ? p.white_amount : 0.0) * 0.55;
 
   uniqueCacheKey(mat);
   mat.onBeforeCompile = (shader) => {
@@ -693,6 +719,7 @@ function applyHair(mat, p, t, loadTex) {
     shader.uniforms.uHairSeedAmp   = { value: seedAmp  };
     shader.uniforms.uHairRoughFlr  = { value: roughFloor };
     shader.uniforms.uHairRoughSeed = { value: roughSeedAmp };
+    shader.uniforms.uHairWhiteAmount = { value: whiteAmount };
     const densityDefault = typeof p.hair_density === 'number' ? p.hair_density
                          : (_useAlphaToCoverage && !isFacialHair ? 2.5 : 1.0);
     shader.uniforms.uHairDensity   = { value: densityDefault };
@@ -706,6 +733,7 @@ function applyHair(mat, p, t, loadTex) {
       uniform float uHairRoughFlr;
       uniform float uHairRoughSeed;
       uniform float uHairDensity;
+      uniform float uHairWhiteAmount;
     ` + shader.fragmentShader;
 
     // Modulate diffuseColor with root→tip darkening + per-strand tint
@@ -726,6 +754,13 @@ function applyHair(mat, p, t, loadTex) {
         float ndv = abs( dot( normalize(vNormal), normalize(vViewPosition) ) );
         float hairAO = mix( 0.3, 1.0, smoothstep( 0.05, 0.55, ndv ) );
         diffuseColor.rgb *= toneMul * strandMul * hairAO;
+        // Per-strand graying: strands whose random seed falls below
+        // uHairWhiteAmount are pushed toward a white/gray tone, so
+        // roughly uHairWhiteAmount's fraction of strands go white —
+        // a salt-and-pepper mix instead of one flat averaged gray.
+        float grayMask = 1.0 - smoothstep( uHairWhiteAmount - 0.06, uHairWhiteAmount + 0.06, seed );
+        vec3 whiteHairColor = vec3( 0.40, 0.39, 0.38 ) * toneMul * hairAO;
+        diffuseColor.rgb = mix( diffuseColor.rgb, whiteHairColor, grayMask * 0.75 );
       #endif
       `
     );
@@ -786,6 +821,12 @@ function addHairInnerPass(mesh, outerMat, spec) {
   const seedAmp  = typeof p.seed_variation === 'number' ? p.seed_variation : 0.36;
   const roughFloor   = typeof p.hair_roughness_floor === 'number' ? p.hair_roughness_floor : 0.55;
   const roughSeedAmp = typeof p.hair_roughness_seed_amp === 'number' ? p.hair_roughness_seed_amp : 0.08;
+  // Scaled down from the raw MH scalar: treating WhiteAmount as a literal
+  // 1:1 fraction of pure-white strands read as too white/blown-out on
+  // screen (specular + AO make bright strands pop more than a matching
+  // fraction of dark strands recedes). 0.55x plus a darker gray target
+  // below is a tuned-by-eye compromise, not a physical MH shader match.
+  const whiteAmount = (typeof p.white_amount === 'number' ? p.white_amount : 0.0) * 0.55;
   const threshold = typeof p.inner_alpha_threshold === 'number'
                     ? p.inner_alpha_threshold : 0.5;
 
@@ -807,12 +848,14 @@ function addHairInnerPass(mesh, outerMat, spec) {
     shader.uniforms.uHairSeedAmp   = { value: seedAmp  };
     shader.uniforms.uHairRoughFlr  = { value: roughFloor };
     shader.uniforms.uHairRoughSeed = { value: roughSeedAmp };
+    shader.uniforms.uHairWhiteAmount = { value: whiteAmount };
     innerMat.userData.hairUniforms = shader.uniforms;
     shader.fragmentShader = `
       uniform float uHairRootDark;
       uniform float uHairSeedAmp;
       uniform float uHairRoughFlr;
       uniform float uHairRoughSeed;
+      uniform float uHairWhiteAmount;
     ` + shader.fragmentShader;
     shader.fragmentShader = shader.fragmentShader.replace(
       '#include <map_fragment>',
@@ -829,6 +872,9 @@ function addHairInnerPass(mesh, outerMat, spec) {
         float ndv = abs( dot( normalize(vNormal), normalize(vViewPosition) ) );
         float hairAO = mix( 0.3, 1.0, smoothstep( 0.05, 0.55, ndv ) );
         diffuseColor.rgb *= toneMul * strandMul * hairAO;
+        float grayMask = 1.0 - smoothstep( uHairWhiteAmount - 0.06, uHairWhiteAmount + 0.06, seed );
+        vec3 whiteHairColor = vec3( 0.40, 0.39, 0.38 ) * toneMul * hairAO;
+        diffuseColor.rgb = mix( diffuseColor.rgb, whiteHairColor, grayMask * 0.75 );
       #endif
       `
     );

@@ -121,15 +121,31 @@ def _parent_hair_to_head_bone(hair_names):
     return parented
 
 
+def _hair_white_amount(mi_params):
+    """MH's `WhiteAmount` scalar (0..1 fraction of graying/white hair) on
+    the groom MI. The viewer applies this per-strand (using the Attribute
+    atlas's per-strand random `seed` channel to pick which strands go
+    white) rather than here, since a flat blend of the pigment color
+    can't reproduce a real salt-and-pepper mix — it just washes every
+    strand out to a uniform gray. This function only extracts the raw
+    scalar for the material spec; `_synth_hair_color` below stays pure
+    pigment."""
+    scalars = (mi_params or {}).get("scalars") or {}
+    return max(0.0, min(1.0, float(scalars.get("WhiteAmount", 0.0))))
+
+
 def _synth_hair_color(mi_params):
-    """Compute MH hair-card Base Color from the MI's scalar/vector params.
+    """Compute MH hair-card pigment Base Color from the MI's scalar/
+    vector params.
 
     Hair cards have NO albedo texture; the Attribute atlas is a data
-    map (R = strand cutout mask, G = root->tip gradient, B = root
-    darkening modulation). Color comes procedurally from the MI's
-    `hairMelanin` (0..1, where 1 = darkest) plus optional `hairRedness`
-    and an `hairDye` RGB multiplier. Formula matches 5.6/cinematic
-    pipeline."""
+    map (R = strand cutout mask, G = root->tip gradient, B = per-strand
+    random seed). Color comes procedurally from the MI's `hairMelanin`
+    (0..1, where 1 = darkest) plus optional `hairRedness` and an
+    `hairDye` RGB multiplier. Formula matches 5.6/cinematic pipeline.
+
+    This is the PIGMENTED color only — graying (`WhiteAmount`) is not
+    applied here; see `_hair_white_amount`."""
     scalars = (mi_params or {}).get("scalars") or {}
     vectors = (mi_params or {}).get("vectors") or {}
     if "hairMelanin" not in scalars:
@@ -158,6 +174,158 @@ def _synth_hair_color(mi_params):
         r *= float(dye[0]); g *= float(dye[1]); b *= float(dye[2])
     clamp = lambda x: max(0.0, min(1.0, x))
     return (clamp(r), clamp(g), clamp(b), 1.0)
+
+
+def _wire_baked_skin_sidecar(in_root, tex_dict, material_predicate, label):
+    """Rebuild a MH-baked skin material (face or body) from scratch
+    around the Base Color / Normal images stage 01 exported directly
+    from the MH-baked Texture2D assets (`tex_dict`, e.g.
+    `mh_manifest["face_skin_textures"]` / `["body_skin_textures"]`),
+    dropping whatever GLTFExporter's material bake produced.
+    `material_predicate(lowercased_material_name)` selects which
+    material to rebuild; `label` is just for log lines.
+
+    Why: GLTFExporter's USE_MESH_DATA bake renders these materials'
+    enormous multi-layer shader graphs (static + animated wrinkle/
+    colormap layers, plus a KHR_materials_specular extension) through
+    an offscreen pass, and that pass comes out visibly blurry
+    regardless of the bake's target resolution — confirmed by directly
+    exporting the same materials' "Basecolor Baked"/"Normal Baked"
+    Texture2D assets (stage 01's `_export_baked_skin_sidecar`) and
+    finding them sharp, full detail (the face's Normal asset is
+    8192x8192 with clearly defined wrinkles/pores; the body's Normal
+    is 8192x8192 too, with garment-seam and skin surface detail).
+    Confirmed on both materials — same architecture, same bug.
+
+    Two more targeted approaches were tried and abandoned before this
+    (on the face material first): mutating the existing Base Color/
+    Normal image nodes' `.image` in place, and replacing just those
+    two nodes while leaving the rest of the imported graph (Occlusion,
+    the KHR_materials_specular specularTexture, etc.) intact. Both hit
+    the same Blender glTF-exporter internal bug ("This case should not
+    happen, please report a bug") on export, and the material shipped
+    with NO baseColorTexture/normalTexture in the resulting glTF at
+    all — the exporter's node-graph-to-glTF-slot heuristic apparently
+    gets confused by *something* in that original imported graph once
+    it's disturbed, not specifically by which node we touch. Clearing
+    the material and rebuilding a plain, minimal Principled BSDF (same
+    pattern already used elsewhere in this file for hair-card and
+    invisible-slot materials) sidesteps the whole graph rather than
+    trying to coexist with it. We lose the Occlusion/Specular maps and
+    the KHR_materials_specular extension these materials used to
+    carry, which is an acceptable trade for skin that isn't blurry.
+
+    The Normal image is raw UE-authored data (DirectX green-channel
+    convention), unlike GLTFExporter's own bake output which the
+    codebase elsewhere assumes is already GL-convention — tagged with
+    `_normal_` in its name so stage 03's `_is_normal_image` name
+    heuristic recognizes it and applies the DX->GL G-flip."""
+    if not tex_dict:
+        _log(f"  {label} skin sidecar: no {label}_skin_textures in mh_manifest.json")
+        return 0
+
+    skin_mat = next(
+        (m for m in bpy.data.materials if material_predicate(m.name.lower())),
+        None)
+    if skin_mat is None or not skin_mat.use_nodes:
+        _log(f"  {label} skin sidecar: no matching baked-skin material found")
+        return 0
+
+    def _load(rel, colorspace):
+        # normpath: `rel` comes from JSON with forward slashes
+        # ("textures/T_Head_BC_VT.png"); os.path.join against a
+        # Windows-style `in_root` produces a mixed-separator path that
+        # loads fine directly but may confuse Blender's relative-path
+        # remap on .blend save.
+        abs_path = os.path.normpath(os.path.join(in_root, rel))
+        if not os.path.isfile(abs_path):
+            _log(f"  {label} skin sidecar: missing file {abs_path}")
+            return None
+        img = bpy.data.images.load(abs_path, check_existing=True)
+        try:
+            img.colorspace_settings.name = colorspace
+        except Exception as e:
+            _log(f"  {label} skin sidecar: colorspace set failed for {rel}: {e}")
+        # Scale down BEFORE packing, straight to the pipeline's web
+        # texture cap (hardcoded 1024 here — matches
+        # glb_constraints.max_texture_px's own fallback default in
+        # stage 03's _read_glb_constraints; update both if that ever
+        # changes). Two reasons to do this here rather than leaving it
+        # to stage 03's existing generic `_downsample_images` pass:
+        #   1. These source assets are enormous (the Normal is
+        #      8192x8192) — no reason to carry that through a save/
+        #      reload boundary and a second Blender process at all.
+        #   2. Empirically, calling scale() + pack() a SECOND time in
+        #      stage 03 on an image already packed here produced a
+        #      final glTF embedding the ORIGINAL pre-scale pixel data
+        #      (stale packed bytes), not the rescaled ones — so we
+        #      scale once, to the real final size, and pack once.
+        biggest = max(img.size[0], img.size[1])
+        cap = 1024
+        if biggest > cap:
+            factor = cap / biggest
+            new_w = max(1, int(img.size[0] * factor))
+            new_h = max(1, int(img.size[1] * factor))
+            _log(f"  {label} skin sidecar: downsample {rel} "
+                 f"{img.size[0]}x{img.size[1]} -> {new_w}x{new_h}")
+            img.scale(new_w, new_h)
+        # A plain external-file reference (source=FILE, not packed) is
+        # lazily loaded — reopening the saved .blend in stage 03 finds
+        # it with no pixel data resident (has_data=False, size 0x0)
+        # until something forces a real read. Blender's own glTF
+        # import path embeds pixel data directly, which is presumably
+        # why every OTHER image in this scene doesn't hit this. Packing
+        # forces an immediate real decode + embeds the result in the
+        # .blend, so it survives the stage02-save -> stage03-reload
+        # boundary the same way those do.
+        try:
+            img.pack()
+        except Exception as e:
+            _log(f"  {label} skin sidecar: pack {rel} failed: {e}")
+        return img
+
+    bc_img = _load(tex_dict["basecolor"], "sRGB") if "basecolor" in tex_dict else None
+    n_img = _load(tex_dict["normal"], "Non-Color") if "normal" in tex_dict else None
+    if n_img is not None:
+        # See docstring: tag so stage 03's normal-map detection (which
+        # otherwise assumes MI_Face_Skin_*/MI_Body_Baked_* images are
+        # already GL-convention from GLTFExporter) picks this up for
+        # G-flipping. Suffix with `label` so face/body don't collide on
+        # the same image name in the same scene.
+        n_img.name = f"{label}_normal_map"
+    if bc_img is None and n_img is None:
+        _log(f"  {label} skin sidecar: no images loaded, leaving material untouched")
+        return 0
+
+    nt = skin_mat.node_tree
+    for n in list(nt.nodes):
+        nt.nodes.remove(n)
+    out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (600, 0)
+    bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location = (300, 0)
+    nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    try: bsdf.inputs["Roughness"].default_value = 0.5
+    except Exception: pass
+
+    swapped = 0
+    if bc_img is not None:
+        tex = nt.nodes.new("ShaderNodeTexImage")
+        tex.image = bc_img
+        tex.location = (-300, 300)
+        nt.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+        swapped += 1
+        _log(f"  {label} skin sidecar: wired Base Color -> {tex_dict['basecolor']}")
+    if n_img is not None and "Normal" in bsdf.inputs:
+        tex = nt.nodes.new("ShaderNodeTexImage")
+        tex.image = n_img
+        tex.location = (-300, -100)
+        nmap = nt.nodes.new("ShaderNodeNormalMap")
+        nmap.location = (0, -100)
+        nt.links.new(tex.outputs["Color"], nmap.inputs["Color"])
+        nt.links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
+        swapped += 1
+        _log(f"  {label} skin sidecar: wired Normal -> {tex_dict['normal']}")
+
+    return swapped
 
 
 def _wire_card_materials(in_root, mh_manifest):
@@ -503,8 +671,9 @@ def _emit_material_spec(out_root, mh_manifest):
         return None
 
     def _hair_color_for(mi_pattern, require_melanin=False):
-        """Find an MI matching pattern, return synth color via 5.6 formula.
-        If `require_melanin` is set, skip MIs that don't override
+        """Find an MI matching pattern, return (synth pigment color,
+        white_amount) via 5.6 formula, or None if no MI matches. If
+        `require_melanin` is set, skip MIs that don't override
         hairMelanin (so eyelash MIs can fall through to the head hair
         MI's color rather than getting the synth default brown)."""
         for mi_name, params in groom_mis.items():
@@ -513,7 +682,7 @@ def _emit_material_spec(out_root, mh_manifest):
             scalars = (params or {}).get("scalars") or {}
             if require_melanin and "hairMelanin" not in scalars:
                 continue
-            return _synth_hair_color(params)
+            return _synth_hair_color(params), _hair_white_amount(params)
         return None
 
     materials = []
@@ -530,20 +699,21 @@ def _emit_material_spec(out_root, mh_manifest):
             # mustache materials need their own branch here too, or
             # stage 04's viewer won't apply hair-shader injection to
             # them and they'll render with the GLTFExporter default.
+            _default = ((0.18, 0.10, 0.05, 1.0), 0.0)
             if ml.startswith("hair_"):
                 stem = _find_stem(["Hair_S_Coil_CardsAtlas_Attribute",
                                    "Hair_"])
-                color = _hair_color_for("mi_wi_hair_") or [0.18, 0.10, 0.05, 1.0]
+                color, white_amount = _hair_color_for("mi_wi_hair_") or _default
             elif ml.startswith("eyebrows_"):
                 stem = _find_stem(["Eyebrows_M_SlightArch_CardsAtlas_Attribute",
                                    "Eyebrows_"])
-                color = _hair_color_for("mi_wi_eyebrows_") or [0.18, 0.10, 0.05, 1.0]
+                color, white_amount = _hair_color_for("mi_wi_eyebrows_") or _default
             elif ml.startswith("beard_"):
                 stem = _find_stem(["Beard_"])
-                color = _hair_color_for("mi_wi_beard_") or [0.18, 0.10, 0.05, 1.0]
+                color, white_amount = _hair_color_for("mi_wi_beard_") or _default
             elif ml.startswith("mustache_") or ml.startswith("moustache_"):
                 stem = _find_stem(["Mustache_"])
-                color = _hair_color_for("mi_wi_mustache_") or [0.18, 0.10, 0.05, 1.0]
+                color, white_amount = _hair_color_for("mi_wi_mustache_") or _default
             else:
                 continue
             if stem is None:
@@ -553,6 +723,10 @@ def _emit_material_spec(out_root, mh_manifest):
                 "kind": "hair",
                 "params": {
                     "base_color": list(color),
+                    # Fraction of strands the viewer should render as
+                    # white/gray (picked per-strand via the Attribute
+                    # atlas's seed channel) — see applyHair() in viewer.js.
+                    "white_amount": white_amount,
                     "alpha_clip": True,
                     "alpha_channel": "r",
                     "alpha_stem": stem,
@@ -566,9 +740,14 @@ def _emit_material_spec(out_root, mh_manifest):
             stem = _find_stem(["T_Eyelashes_", "Eyelashes_"])
             if stem is None:
                 continue
-            color = (_hair_color_for("mi_wi_eyelashes_", require_melanin=True)
-                     or _hair_color_for("mi_wi_hair_", require_melanin=True)
-                     or [0.05, 0.03, 0.02, 1.0])
+            # Eyelashes render via a plain grayscale-coverage material
+            # (no root/seed data channels), so there's no per-strand
+            # graying to drive — just use the flat pigment color and
+            # drop white_amount.
+            color, _lash_white_amount = (
+                _hair_color_for("mi_wi_eyelashes_", require_melanin=True)
+                or _hair_color_for("mi_wi_hair_", require_melanin=True)
+                or ((0.05, 0.03, 0.02, 1.0), 0.0))
             materials.append({
                 "material_name": mn,
                 "kind": "face_accessory",
@@ -587,7 +766,7 @@ def _emit_material_spec(out_root, mh_manifest):
 
     out_path = os.path.join(out_root, "mh_materials.json")
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump({"character": "ada",  # caller can overwrite if needed
+        json.dump({"character": mh_manifest.get("character_id", "unknown"),
                    "saved_at": _iso_now(),
                    "materials": materials}, f, indent=2)
     return materials
@@ -1878,6 +2057,29 @@ def main():
     scalp_darkened = _bake_scalp_darkening()
     if scalp_darkened:
         _log(f"baked scalp darkening onto {scalp_darkened} face vert(s)")
+
+    # Runs LAST, right before save: earlier positions in this pipeline
+    # (immediately after import) had the freshly-wired skin images
+    # vanish from the saved .blend — reproducibly reopening as "cycles:
+    # Failed to load N image files" / a material with no
+    # baseColorTexture/normalTexture at all — while direct inspection of
+    # the .blend right after THIS function ran showed the wiring intact.
+    # One of the several `orphans_purge(do_recursive=True)` calls between
+    # here and there (_remove_gltf_placeholder_empties,
+    # _bake_scalp_darkening, etc.) was the likely culprit. Running last
+    # leaves nothing after it to purge the newly-created image/node
+    # datablocks before they're written out.
+    face_swapped = _wire_baked_skin_sidecar(
+        in_root, mh.get("face_skin_textures"),
+        lambda n: "face_skin_baked" in n and "lod0" in n, "face")
+    if face_swapped:
+        _log(f"face skin sidecar: swapped {face_swapped} image(s) onto the skin material")
+
+    body_swapped = _wire_baked_skin_sidecar(
+        in_root, mh.get("body_skin_textures"),
+        lambda n: "body_baked" in n, "body")
+    if body_swapped:
+        _log(f"body skin sidecar: swapped {body_swapped} image(s) onto the skin material")
 
     # Save blend
     blend_path = os.path.join(out_root, f"{args.char}.blend")

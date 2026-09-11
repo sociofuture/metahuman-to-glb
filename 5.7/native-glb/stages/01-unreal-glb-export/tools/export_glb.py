@@ -122,14 +122,30 @@ def _make_gltf_options():
       - export_uniform_scale=0.01 — UE is cm; glTF expects metres.
       - texture_image_format=PNG — lossless skin textures.
 
-    Bake size stays at the exporter default (1024). The quality problem
-    is not the bake output dimensions — it's that the SOURCE textures
-    used by the bake are low-res when build_meta_human runs before
-    `has_high_resolution_textures` flips. Fix that in stage 0, not here.
+    `default_material_bake_size` defaults to `{x:1024, y:1024,
+    auto_detect:True}`. `auto_detect` is the real culprit behind the
+    long-standing "looks like 256" blur complaint attributed elsewhere
+    to source-texture streaming: it picks the bake render-target size
+    from whatever mip is CURRENTLY RESIDENT on the source textures at
+    bake time. Stage 01 runs as a fresh headless commandlet with no
+    streaming history, so residency sits at the smallest fallback mip
+    (measured 32x32 for MH's face skin layers) — auto_detect then bakes
+    at that tiny size and the exporter upscales it to fill the nominal
+    1024 canvas, which is exactly what "labelled 1024, visibly
+    upsampled" looks like. Forcing auto_detect=False with an explicit
+    size bakes at that size regardless of streaming state, fixing the
+    problem outright (confirmed: forehead wrinkles / eyelid folds /
+    pores go from nearly invisible to clearly visible). Baking bigger
+    than the final glb_constraints.max_texture_px (1024, enforced by
+    stage 03's downsample) still helps — a 1024 output *downsampled
+    from* a real 2048 bake keeps far more detail than a 1024 output
+    upscaled from a streamed-in 32px mip.
     """
     opts = unreal.GLTFExportOptions()
     for k, v in (
         ("bake_material_inputs", unreal.GLTFMaterialBakeMode.USE_MESH_DATA),
+        ("default_material_bake_size",
+         unreal.GLTFMaterialBakeSize(x=2048, y=2048, auto_detect=False)),
         # Disable GLB morph export — adds 858 raw RigLogic morphs that
         # bloat the GLB by ~750 MB and ship as 8-primitive × 858-target
         # arrays even on primitives that don't deform (teeth, eyeballs).
@@ -461,19 +477,42 @@ def _textures_in_material(mi, seen):
     """Yield (param_name_or_None, texture) for every Texture2D the
     material references — first via named texture parameters, then
     via get_used_textures() to catch hard-wired refs in the parent
-    material graph."""
+    material graph.
+
+    Texture parameter values are read via `texture_parameter_values`
+    on the MaterialInstance (same pattern as `_read_mi_params`'s
+    vector/scalar reads below) — NOT via
+    `MaterialEditingLibrary.get_texture_parameter_value`, which does
+    not exist in this UE Python API (AttributeError) and would
+    silently no-op every named-parameter texture under the blanket
+    try/except, leaving only get_used_textures()'s hits."""
     try:
         names = unreal.MaterialEditingLibrary.get_texture_parameter_names(mi) or []
     except Exception:
         names = []
-    for n in names:
+    if names:
         try:
-            tex = unreal.MaterialEditingLibrary.get_texture_parameter_value(mi, n)
+            tex_params = mi.get_editor_property("texture_parameter_values") or []
         except Exception:
-            tex = None
-        if tex is not None and tex not in seen:
-            seen.add(tex)
-            yield str(n), tex
+            tex_params = []
+        by_name = {}
+        for tp in tex_params:
+            try:
+                pi = tp.get_editor_property("parameter_info")
+                pname = str(pi.get_editor_property("name")) if pi else None
+            except Exception:
+                pname = None
+            if not pname:
+                continue
+            try:
+                by_name[pname] = tp.get_editor_property("parameter_value")
+            except Exception:
+                pass
+        for n in names:
+            tex = by_name.get(str(n))
+            if tex is not None and tex not in seen:
+                seen.add(tex)
+                yield str(n), tex
     try:
         used = unreal.MaterialEditingLibrary.get_used_textures(mi) or []
     except Exception:
@@ -594,6 +633,86 @@ def _export_sidecar_textures(asset, textures_dir, seen_tex):
             except Exception as e:
                 _log(f"    sidecar PNG fail {tex_name}: {e}")
     return records
+
+
+def _export_baked_skin_sidecar(mesh, name_predicate, label, textures_dir):
+    """Directly export an MH-baked skin material's own BaseColor /
+    Normal / SRMF Texture2D assets as PNGs, bypassing GLTFExporter's
+    material bake entirely. `name_predicate(lowercased_material_name)`
+    selects which material on `mesh` to use; `label` is just for log
+    lines (e.g. "face", "body").
+
+    Why: MH's baked skin materials (`MI_Face_Skin_Baked_LOD0_VT_...`,
+    `MI_Body_Baked_VT_...`) are enormous multi-layer graphs — dozens of
+    texture parameters (static base layers, animated wrinkle/colormap
+    deltas, micro-detail normals) blended together, with the pre-
+    composited result exposed as "Basecolor Baked [VT]" / "Normal
+    Baked [VT]" / "SRMF Baked [VT]" parameters pointing at real per-
+    character Texture2D assets under `<Face|Body>/Baked/` (e.g. the
+    face's `T_Head_N_VT` is 8192x8192 with full wrinkle/pore detail;
+    the body's `T_Body_N_VT` is 8192x8192 too, with garment-seam and
+    skin surface detail). GLTFExporter's USE_MESH_DATA bake renders
+    that graph through an offscreen pass instead of reading those
+    assets directly, and — independent of the material-bake-size fix
+    above — that render pass comes out visibly blurry regardless of
+    target resolution (a 2048 bake of a 32px-blurred render is still
+    blurry, just bigger). Exporting these Texture2D assets directly via
+    AssetExportTask (same mechanism as `_export_texture_png`, which
+    reads stored mip0/source data, not a render-target) sidesteps the
+    bake path entirely and gets the real detail. Confirmed on both the
+    face and body materials — same architecture, same bug, same fix.
+
+    Returns a dict of {slot: relative_file_path} for whichever of
+    basecolor/normal/srmf were found (VT variant preferred, falling
+    back to the non-VT parameter if that's what the material uses),
+    or an empty dict if the material/params couldn't be found."""
+    skin_mi = None
+    for _slot, mi in _iter_materials(mesh):
+        if name_predicate(mi.get_name().lower()):
+            skin_mi = mi
+            break
+    if skin_mi is None:
+        _log(f"  {label} skin sidecar: no matching baked-skin material found")
+        return {}
+
+    try:
+        tex_params = skin_mi.get_editor_property("texture_parameter_values") or []
+    except Exception as e:
+        _log(f"  {label} skin sidecar: texture_parameter_values read failed: {e}")
+        return {}
+    by_name = {}
+    for tp in tex_params:
+        try:
+            pi = tp.get_editor_property("parameter_info")
+            pname = str(pi.get_editor_property("name")) if pi else None
+            tex = tp.get_editor_property("parameter_value")
+        except Exception:
+            continue
+        if pname and tex is not None:
+            by_name[pname] = tex
+
+    wanted = {
+        "basecolor": ("Basecolor Baked VT", "Basecolor Baked"),
+        "normal":    ("Normal Baked VT", "Normal Baked"),
+        "srmf":      ("SRMF Baked VT", "SRMF Baked"),
+    }
+    out = {}
+    for slot, candidates in wanted.items():
+        tex = next((by_name[n] for n in candidates if n in by_name), None)
+        if tex is None:
+            _log(f"  {label} skin sidecar: no texture for {slot} ({candidates})")
+            continue
+        tex_name = tex.get_name()
+        rel = f"textures/{tex_name}.png"
+        abs_path = os.path.join(textures_dir, f"{tex_name}.png")
+        try:
+            _export_texture_png(tex, abs_path)
+            sz = os.path.getsize(abs_path) if os.path.exists(abs_path) else 0
+            _log(f"  {label} skin sidecar: {slot} -> {rel} ({sz/1_000_000:.1f} MB)")
+            out[slot] = rel
+        except Exception as e:
+            _log(f"  {label} skin sidecar: export {tex_name} failed: {e}")
+    return out
 
 
 def main():
@@ -866,6 +985,31 @@ def main():
             _log(f"  ARKit source export failed: {e}")
             warnings.append(f"arkit_sources: {e}")
 
+    # Directly export the face + body skin materials' own BaseColor/
+    # Normal/SRMF Texture2D assets, bypassing GLTFExporter's material
+    # bake — see _export_baked_skin_sidecar's docstring for why. Stage
+    # 02 wires these onto the respective materials in place of whatever
+    # the glTF bake produced.
+    face_skin_textures = {}
+    if face_skm is not None:
+        try:
+            face_skin_textures = _export_baked_skin_sidecar(
+                face_skm, lambda n: "face_skin_baked" in n and "lod0" in n,
+                "face", textures_dir)
+        except Exception as e:
+            _log(f"  face skin sidecar export failed: {e}")
+            warnings.append(f"face_skin_sidecar: {e}")
+
+    body_skin_textures = {}
+    body_skm = next((a for a in skm if "BodyMesh" in a.get_name()), None)
+    if body_skm is not None:
+        try:
+            body_skin_textures = _export_baked_skin_sidecar(
+                body_skm, lambda n: "body_baked" in n, "body", textures_dir)
+        except Exception as e:
+            _log(f"  body skin sidecar export failed: {e}")
+            warnings.append(f"body_skin_sidecar: {e}")
+
     mh_manifest = {
         "character_id": args.char,
         "ue_version": char_manifest.get("ue_version", "5.7"),
@@ -876,6 +1020,8 @@ def main():
         "sidecar_textures": sidecar_records,
         "groom_materials": groom_materials,
         "arkit_sources": arkit_sources,
+        "face_skin_textures": face_skin_textures,
+        "body_skin_textures": body_skin_textures,
         "warnings": warnings,
     }
     with open(os.path.join(out_dir, "mh_manifest.json"), "w", encoding="utf-8") as f:
