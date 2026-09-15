@@ -78,11 +78,16 @@ def _parent_hair_to_head_bone(hair_names):
     """Hair cards arrive from UE's glTF exporter already positioned
     correctly — MH bakes hair-card StaticMesh verts in character-world
     space (origin at character root, verts at head height), so the mesh
-    sits at the right place just by being imported. All we need to do
-    is (a) pick the face armature as the logical parent so the hair
-    follows the character's root motion, and (b) NOT translate the
-    mesh. We preserve the existing world transform via
-    matrix_parent_inverse."""
+    sits at the right place just by being imported. We parent them
+    (hair, eyebrows, beard, mustache — anything role="hair" from stage
+    01) to the face armature's `head` BONE, not just the armature
+    object: bone-level parenting tracks the head bone's own pose within
+    the face skeleton (rotation/translation), whereas object-level
+    parenting only tracks the armature object's root transform as a
+    rigid whole. These cards are meant to follow the FACE skeleton
+    specifically (they're groomed relative to the head), not the body
+    skeleton — merging them into the body rig would be wrong even where
+    that merge is otherwise safe for clothing (see _merge_armatures)."""
     # Prefer face armature (has the full facial rig)
     target_arm = None
     for arm in bpy.data.objects:
@@ -104,14 +109,38 @@ def _parent_hair_to_head_bone(hair_names):
         _log("no armature found for hair-card parenting")
         return 0
 
-    _log(f"hair parent: {target_arm.name}")
+    head_bone = next((b.name for b in target_arm.data.bones
+                       if b.name.lower() == "head"), None)
+    _log(f"hair parent: {target_arm.name}" +
+         (f", bone '{head_bone}'" if head_bone
+          else " (object-level — no 'head' bone found on this armature)"))
+
+    hair_objs = [obj for obj in bpy.data.objects
+                 if obj.type == "MESH"
+                 and any(h in obj.name.lower() for h in hair_names)]
+    if not hair_objs:
+        return 0
+
+    if head_bone is not None:
+        try:
+            bpy.ops.object.select_all(action="DESELECT")
+            for obj in hair_objs:
+                obj.select_set(True)
+            target_arm.select_set(True)
+            bpy.context.view_layer.objects.active = target_arm
+            target_arm.data.bones.active = target_arm.data.bones[head_bone]
+            bpy.ops.object.parent_set(type="BONE", keep_transform=True)
+            bpy.ops.object.select_all(action="DESELECT")
+            return len(hair_objs)
+        except Exception as e:
+            _log(f"  bone-parent to '{head_bone}' failed ({e}); "
+                 f"falling back to object-level parenting")
+
+    # Fallback (no head bone found, or the operator failed): object-level
+    # parenting to the armature's root. Tracks root motion only — not the
+    # head bone's own pose — but keeps hair positioned rather than orphaned.
     parented = 0
-    for obj in bpy.data.objects:
-        if obj.type != "MESH":
-            continue
-        if not any(h in obj.name.lower() for h in hair_names):
-            continue
-        # Preserve current world transform exactly.
+    for obj in hair_objs:
         world_mat = obj.matrix_world.copy()
         obj.parent = target_arm
         obj.parent_type = "OBJECT"
@@ -119,6 +148,90 @@ def _parent_hair_to_head_bone(hair_names):
         obj.matrix_world = world_mat
         parented += 1
     return parented
+
+
+def _merge_armatures():
+    """Merge compatible ARMATURE objects in the scene into one skeleton.
+
+    UE exports each SkeletalMesh (body, face, and every outfit/clothing
+    piece) as its own .glb, and each one carries its OWN copy of its
+    joint hierarchy as a separate Armature object. Blender's Armature
+    *modifier* binds a mesh to one specific Armature OBJECT, not to
+    bones by name across objects, so posing e.g. the body armature only
+    moves meshes whose modifier points at that object — clothing bound
+    to a different (but bone-for-bone identical) armature object stays
+    in bind pose and visibly detaches. This is the root cause reported
+    after re-posing the body skeleton: the outfit not following.
+
+    IMPORTANT: MH's face armature is NOT a superset of the body
+    armature and can't be safely unioned with it here — confirmed by
+    inspecting a real export: the face rig (~875 bones: core spine/neck
+    /head chain + hundreds of RigLogic facial-corrective joints) is
+    missing the entire leg/foot chain the body rig has (it doesn't even
+    have a `Root` bone), while the body/outfit rig doesn't have the
+    facial correctives. They're related-but-different skeletons that
+    happen to share some bone names, not one containing the other. A
+    naive merge would silently produce duplicate/renamed bones on name
+    collisions (e.g. two `head` bones) with correct-looking geometry but
+    WRONG pose propagation — worse than leaving them separate. So this
+    only merges the body-family armatures (body + outfits, which really
+    are the same skeleton bone-for-bone): pick the `*BodyMesh*` armature
+    as canonical, verify every other armature's bone-name set is a
+    subset of it (glTF vertex groups are already keyed by bone name, so
+    once a mesh's modifier points at the canonical armature its existing
+    vertex groups just work — no reweighting needed), repoint every
+    mesh's Armature modifier + object parent at the canonical armature,
+    and delete the now-redundant duplicates. Anything that isn't a
+    subset (the face armature, by design) is left alone and logged."""
+    arms = [o for o in bpy.data.objects if o.type == "ARMATURE"]
+    if len(arms) <= 1:
+        _log(f"skeleton merge: {len(arms)} armature(s) in scene, nothing to merge")
+        return 0
+
+    body_arms = [a for a in arms if "bodymesh" in a.name.lower()]
+    if body_arms:
+        primary = max(body_arms, key=lambda a: len(a.data.bones))
+    else:
+        _log("skeleton merge: no '*BodyMesh*' armature found; "
+             "falling back to most-bones heuristic")
+        primary = max(arms, key=lambda a: len(a.data.bones))
+    primary_bones = set(b.name for b in primary.data.bones)
+    _log(f"skeleton merge: {len(arms)} armature(s) found; "
+         f"canonical='{primary.name}' ({len(primary_bones)} bones)")
+
+    merged = 0
+    for arm in [a for a in arms if a is not primary]:
+        bones = set(b.name for b in arm.data.bones)
+        missing = bones - primary_bones
+        if missing:
+            _log(f"  SKIP '{arm.name}' ({len(bones)} bones): {len(missing)} "
+                 f"bone(s) not present in canonical skeleton (e.g. "
+                 f"{sorted(missing)[:5]}) — not a safe merge, leaving separate")
+            continue
+
+        retargeted = 0
+        for obj in list(bpy.data.objects):
+            if obj.type != "MESH":
+                continue
+            mod = next((m for m in obj.modifiers
+                        if m.type == "ARMATURE" and m.object is arm), None)
+            if mod is None:
+                continue
+            world_mat = obj.matrix_world.copy()
+            mod.object = primary
+            if obj.parent is arm:
+                obj.parent = primary
+                obj.parent_type = "OBJECT"
+                obj.matrix_parent_inverse = primary.matrix_world.inverted()
+                obj.matrix_world = world_mat
+            retargeted += 1
+
+        _log(f"  merged '{arm.name}' -> '{primary.name}' "
+             f"({retargeted} mesh(es) retargeted)")
+        bpy.data.objects.remove(arm, do_unlink=True)
+        merged += 1
+
+    return merged
 
 
 def _hair_white_amount(mi_params):
@@ -1954,6 +2067,17 @@ def main():
 
     hidden = _hide_non_lod0()
     _log(f"hid {hidden} non-LOD0/collision meshes")
+
+    # Body, face, and every outfit/clothing SkeletalMesh each arrive with
+    # their OWN copy of the MH joint hierarchy as a separate Armature
+    # object. Merge them into one canonical skeleton now, before anything
+    # downstream picks "the" armature by name — otherwise posing one
+    # skeleton (e.g. the body) leaves clothing/hair/brows bound to a
+    # different, un-posed armature and they visibly detach. See
+    # _merge_armatures() docstring for the full rationale.
+    merged_arms = _merge_armatures()
+    if merged_arms:
+        _log(f"merged {merged_arms} duplicate armature(s) into one skeleton")
 
     # ARKit shape-key bake from the Sequencer-baked LSE FBX (stage 01).
     # UE's Sequencer evaluates the AnimSequence through a live

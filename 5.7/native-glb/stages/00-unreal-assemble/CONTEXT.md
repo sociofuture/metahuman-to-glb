@@ -59,6 +59,17 @@ Python environment. The script:
    build) and writes it to the character manifest as a top-level
    `ue_content_root` field — stage 01 reads that instead of assuming a
    fixed path.
+   **Rebuild-in-place (e.g. re-running after an outfit change):** if the
+   character was already built in an earlier session, `build_meta_human`
+   updates the existing SkeletalMesh packages at their prior paths
+   instead of creating new ones, so the before/after diff finds nothing
+   "new". The script falls back to a name-match search (all `/Game`
+   SkeletalMeshes whose package path contains the character's
+   `output_name`) and treats those as the asset set. If that also finds
+   nothing, the stage fails loud (`status: FAILED`) instead of silently
+   reporting `DONE` with zero assets — a `--force` bootstrap resets the
+   pipeline manifest but does **not** delete anything from the UE
+   project, so this path is expected to trigger on ordinary re-runs.
 7. Reference screenshot: spawn the assembled face / body / outfits /
    groom-card actors in the editor world, point the perspective
    viewport at the head, fire `HighResShot 1024x1024`, and copy the

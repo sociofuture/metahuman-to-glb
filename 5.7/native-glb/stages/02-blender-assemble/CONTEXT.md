@@ -56,6 +56,27 @@ fix or retroactively mark other stages' status.
 4. The script does (in order):
    - Import every GLB listed in `mh_manifest.assets[]` into a clean scene.
    - Hide non-LOD0 / collision meshes.
+   - Merge the body-family Armature objects in the scene into one
+     skeleton (`_merge_armatures`): body and each outfit piece each
+     arrive with their own copy of the body joint hierarchy as a
+     separate Armature object, even though bone names are identical
+     (same underlying body skeleton). Left unmerged, posing one armature
+     (e.g. the body) leaves meshes bound to a different armature
+     object — most visibly clothing — stuck in bind pose while the body
+     moves. The `*BodyMesh*` armature is kept as canonical; every other
+     armature whose bone-name set is a full subset of it (in practice
+     the outfit pieces) is repointed — every mesh's Armature modifier +
+     object parent onto the canonical armature (vertex groups are
+     already keyed by bone name, so no reweighting is needed) — and the
+     duplicate armature is deleted. The face armature is deliberately
+     NOT merged in: MH's facial rig (~875 bones: core spine/neck/head +
+     hundreds of RigLogic corrective joints) is a different skeleton
+     from the body rig, not a superset of it (confirmed on a real
+     export — it lacks the entire leg/foot chain and even `Root`), so
+     forcing it into the same armature would risk silently-wrong pose
+     propagation on name-collision bones rather than just staying
+     separate. Any armature that isn't a clean subset is left alone and
+     logged loudly.
    - Bake 51 ARKit shape keys onto the face mesh via
      `_bake_arkit_from_lse_fbx`: import LSE FBX, scrub frame N for pose N
      (1:1 mapping at 24fps bake), capture deformed mesh via
@@ -73,8 +94,12 @@ fix or retroactively mark other stages' status.
    - Tune invisible MH face slots (eyeShell, M_Hide, lacrimal, saliva)
      to fully transparent Principled BSDF so they don't paint over
      irises.
-   - Parent hair-card StaticMeshes to the face armature's head bone so
-     they track head motion.
+   - Parent hair-card StaticMeshes (hair, eyebrows, beard, mustache) to
+     the face armature's `head` BONE specifically (`bpy.ops.object.
+     parent_set(type='BONE')`, not object-level parenting) so they track
+     the head bone's own pose, not just the armature object's root
+     transform. Falls back to object-level parenting (root motion only)
+     if no `head` bone is found on the armature.
    - Emit `mh_materials.json` (used by stage 04 viewer for hair / lash
      shader injection).
 5. Verify outputs (Outputs table). Required: `<id>.blend`, `mh_materials.json`,
@@ -142,3 +167,17 @@ read. Re-running is safe.
   file size (~46 MB expected).
 - kdtree match max > 5mm → LSE face and GLB face came from different
   SKM builds. Re-run stage 01 to get a consistent pair.
+- Log line `skeleton merge: SKIP '<armature>' (...): N bone(s) not present
+  in canonical skeleton` → that armature was NOT merged into the body
+  skeleton. Expected and harmless for the face armature (by design, see
+  `_merge_armatures`). If it fires for an OUTFIT piece instead, that
+  outfit's bone set genuinely diverges from the body skeleton (not just
+  a naming mismatch) — check the UE asset for a custom/non-standard
+  skeleton before assuming this is a pipeline bug. It will still detach
+  when the body is re-posed until that's resolved.
+- Log line `skeleton merge: no '*BodyMesh*' armature found; falling back
+  to most-bones heuristic` → the scene's armature naming doesn't match
+  the expected `SKM_<char>_BodyMesh` pattern (stage 01 renamed it, or
+  this character has no body mesh). The most-bones fallback may pick the
+  face armature as canonical, which is very likely wrong — check why the
+  body armature wasn't found before trusting the merge result.
