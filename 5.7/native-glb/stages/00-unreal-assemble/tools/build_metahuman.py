@@ -556,6 +556,48 @@ def on_tick(dt: float) -> None:
                 log(f"build complete; {len(new_assets)} new SkeletalMesh asset(s) in /Game")
                 for a in new_assets[:20]:
                     log(f"  + {a}")
+
+                if not new_assets:
+                    # Rebuild-in-place: the character was already built in
+                    # an earlier session (e.g. operator changed the outfit
+                    # and re-ran this stage). build_meta_human() then
+                    # UPDATES the existing SkeletalMesh packages at their
+                    # prior paths instead of creating new ones, so the
+                    # before/after diff — which only catches assets that
+                    # didn't exist yet THIS session — sees nothing, even
+                    # though the build genuinely ran and (probably)
+                    # succeeded. bootstrap_character.py --force resets
+                    # the pipeline-side manifest but does NOT delete
+                    # anything from the UE project, so this happens on
+                    # every re-run of an already-built character.
+                    # Fall back to a name-match search across all /Game
+                    # SkeletalMeshes for the character's output_name —
+                    # this finds the same (now-updated) assets regardless
+                    # of whether the diff saw them as "new".
+                    needle = STATE["output_name"].lower()
+                    matching = sorted(a for a in now_skel if needle in a.lower())
+                    if matching:
+                        log(f"  no NEW assets, but {len(matching)} existing "
+                            f"SkeletalMesh asset(s) match '{STATE['output_name']}' "
+                            f"— treating as rebuild-in-place")
+                        for a in matching[:20]:
+                            log(f"  + {a}")
+                        new_assets = matching
+                    else:
+                        log(f"  ERROR: build_meta_human produced 0 new assets AND "
+                            f"no existing SkeletalMesh matches "
+                            f"'{STATE['output_name']}' — the build did not "
+                            f"actually produce usable output")
+                        write_status(
+                            "FAILED",
+                            error=(f"build_meta_human produced 0 SkeletalMesh "
+                                   f"assets (no new, no existing match for "
+                                   f"'{STATE['output_name']}')"))
+                        STATE["finished"] = True
+                        try: unreal.SystemLibrary.quit_editor()
+                        except Exception: pass
+                        return
+
                 content_root = _derive_content_root(new_assets)
                 if content_root is None:
                     log(f"  WARNING: new assets don't share a common root; "
