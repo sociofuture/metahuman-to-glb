@@ -77,6 +77,21 @@ fix or retroactively mark other stages' status.
      propagation on name-collision bones rather than just staying
      separate. Any armature that isn't a clean subset is left alone and
      logged loudly.
+   - Renormalize skin weights (`_renormalize_skin_weights`): UE's
+     GLTFExporter (stage 01) caps every vertex at 4 joint influences and
+     does NOT rescale the ones it keeps, so a vertex that genuinely needs
+     5+ influences (common on outfit neck/collar/shoulder seams, where
+     clavicle + neck + spine_04 all blend at once — confirmed by reading
+     the raw stage 01 GLB directly: whole outfit primitives had mean
+     weight-sum 0.18-0.40, vs. ~1.0 on the body mesh) arrives critically
+     under-weighted. Since Blender's Armature modifier applies vertex-
+     group weights as literal coefficients (no auto-normalize), an under-
+     summed vertex barely moves when posed while its fully-weighted
+     neighbor across the seam moves normally — tearing the mesh apart.
+     This can't recover the dropped 5th+ influence, but rescaling the
+     surviving 4 back to summing to 1.0 removes the near-frozen-vertex
+     failure mode. Runs after the armature merge (bone-name lookups need
+     each mesh's final Armature modifier target).
    - Bake 51 ARKit shape keys onto the face mesh via
      `_bake_arkit_from_lse_fbx`: import LSE FBX, scrub frame N for pose N
      (1:1 mapping at 24fps bake), capture deformed mesh via
@@ -170,9 +185,12 @@ read. Re-running is safe.
 - Log line `skeleton merge: SKIP '<armature>' (...): N bone(s) not present
   in canonical skeleton` → that armature was NOT merged into the body
   skeleton. Expected and harmless for the face armature (by design, see
-  `_merge_armatures`). If it fires for an OUTFIT piece instead, that
-  outfit's bone set genuinely diverges from the body skeleton (not just
-  a naming mismatch) — check the UE asset for a custom/non-standard
+  `_merge_armatures`). The subset check is case-insensitive (UE has been
+  observed to export the root bone as `Root` on outfit SkeletalMeshes vs.
+  `root` on the body one — same bone, harmless case difference, no longer
+  triggers a SKIP). If it still fires for an OUTFIT piece, that outfit's
+  bone set genuinely diverges from the body skeleton (real missing bones,
+  not just a case mismatch) — check the UE asset for a custom/non-standard
   skeleton before assuming this is a pipeline bug. It will still detach
   when the body is re-posed until that's resolved.
 - Log line `skeleton merge: no '*BodyMesh*' armature found; falling back

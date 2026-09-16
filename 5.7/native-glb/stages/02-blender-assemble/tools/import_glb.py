@@ -196,13 +196,21 @@ def _merge_armatures():
              "falling back to most-bones heuristic")
         primary = max(arms, key=lambda a: len(a.data.bones))
     primary_bones = set(b.name for b in primary.data.bones)
+    # Case-insensitive lookup: UE has been observed to export the root bone
+    # as "Root" on outfit SkeletalMeshes but "root" (lowercase) on the body
+    # SkeletalMesh — same bone, different case. An exact-match subset check
+    # treats that single bone as "not present" and SKIPs the whole outfit,
+    # leaving it permanently detached from the body armature. Vertex groups
+    # are renamed to the canonical bone's exact case below so the Armature
+    # modifier's (case-sensitive) name lookup still resolves correctly.
+    primary_bones_by_lower = {b.lower(): b for b in primary_bones}
     _log(f"skeleton merge: {len(arms)} armature(s) found; "
          f"canonical='{primary.name}' ({len(primary_bones)} bones)")
 
     merged = 0
     for arm in [a for a in arms if a is not primary]:
         bones = set(b.name for b in arm.data.bones)
-        missing = bones - primary_bones
+        missing = {b for b in bones if b.lower() not in primary_bones_by_lower}
         if missing:
             _log(f"  SKIP '{arm.name}' ({len(bones)} bones): {len(missing)} "
                  f"bone(s) not present in canonical skeleton (e.g. "
@@ -217,6 +225,10 @@ def _merge_armatures():
                         if m.type == "ARMATURE" and m.object is arm), None)
             if mod is None:
                 continue
+            for vg in obj.vertex_groups:
+                canonical = primary_bones_by_lower.get(vg.name.lower())
+                if canonical and canonical != vg.name:
+                    vg.name = canonical
             world_mat = obj.matrix_world.copy()
             mod.object = primary
             if obj.parent is arm:
@@ -232,6 +244,55 @@ def _merge_armatures():
         merged += 1
 
     return merged
+
+
+def _renormalize_skin_weights():
+    """Rescale each deformed vertex's bone weights to sum to 1.0.
+
+    UE's GLTFExporter (stage 01) caps every vertex at 4 joint influences
+    (glTF core's JOINTS_0/WEIGHTS_0 limit) but — confirmed by inspecting
+    the raw stage 01 GLBs directly — does NOT renormalize the 4 it keeps.
+    A vertex genuinely needing 5+ influences (common on this outfit's
+    neck/collar/shoulder, where clavicle + neck + spine_04 all blend at
+    once) arrives here with its top-4 weights summing to well under 1.0
+    (observed means as low as 0.18-0.40 across whole outfit primitives,
+    vs. ~1.0 on the body mesh, which needs fewer simultaneous influences
+    almost everywhere). Blender's Armature modifier does NOT auto-
+    normalize — it applies vertex-group weights as literal coefficients —
+    so an under-summed vertex only gets pulled a fraction of the way
+    toward its bones' pose and stays near bind position while its fully-
+    weighted neighbors (on the other side of a UV/material seam) move
+    normally, tearing the mesh apart under any real pose. This can't
+    recover the dropped 5th+ influence, but rescaling the 4 that survived
+    back up to full strength removes the dominant, catastrophic failure
+    mode (a near-frozen vertex next to a normally-moving one)."""
+    fixed_meshes = 0
+    fixed_verts = 0
+    for obj in bpy.data.objects:
+        if obj.type != "MESH":
+            continue
+        mod = next((m for m in obj.modifiers if m.type == "ARMATURE" and m.object), None)
+        if mod is None:
+            continue
+        bone_names = set(b.name for b in mod.object.data.bones)
+        deform_vgs = {vg.index: vg for vg in obj.vertex_groups if vg.name in bone_names}
+        if not deform_vgs:
+            continue
+        mesh_fixed = 0
+        for v in obj.data.vertices:
+            total = sum(ge.weight for ge in v.groups if ge.group in deform_vgs)
+            if total > 1e-6 and abs(total - 1.0) > 1e-3:
+                scale = 1.0 / total
+                for ge in v.groups:
+                    if ge.group in deform_vgs:
+                        deform_vgs[ge.group].add([v.index], ge.weight * scale, "REPLACE")
+                mesh_fixed += 1
+        if mesh_fixed:
+            fixed_meshes += 1
+            fixed_verts += mesh_fixed
+            _log(f"  renormalized {mesh_fixed}/{len(obj.data.vertices)} vert(s) on "
+                 f"'{obj.name}' (weight sum was != 1.0)")
+    return fixed_meshes, fixed_verts
 
 
 def _hair_white_amount(mi_params):
@@ -2078,6 +2139,17 @@ def main():
     merged_arms = _merge_armatures()
     if merged_arms:
         _log(f"merged {merged_arms} duplicate armature(s) into one skeleton")
+
+    # See _renormalize_skin_weights() docstring: UE's GLTFExporter drops
+    # any influence beyond the 4th per vertex without rescaling the ones
+    # it keeps, so vertices needing 5+ influences arrive critically under-
+    # weighted and barely move when posed, tearing away from their fully-
+    # weighted neighbors. Must run after the armature merge so bone-name
+    # lookups resolve against each mesh's now-final Armature modifier.
+    fixed_meshes, fixed_verts = _renormalize_skin_weights()
+    if fixed_meshes:
+        _log(f"renormalized skin weights on {fixed_meshes} mesh(es), "
+             f"{fixed_verts} vert(s) total")
 
     # ARKit shape-key bake from the Sequencer-baked LSE FBX (stage 01).
     # UE's Sequencer evaluates the AnimSequence through a live
