@@ -26,6 +26,7 @@ characters' artifacts.
 | Character manifest | `characters/<id>/manifest.json` | `character_id` | Identify the character only — DO NOT read or modify other stages' status fields |
 | Stage 01 manifest | `characters/<id>/01-glb/mh_manifest.json` | `assets[]`, `arkit_sources`, `sidecar_textures`, `groom_materials` | What to import + ARKit source paths + groom MI params |
 | Stage 01 GLBs | `characters/<id>/01-glb/*.glb` | all | Per-mesh geometry + textures (no morphs in this pass) |
+| Stage 01 skin-weight FBXs | `characters/<id>/01-glb/*.skinweights.fbx` | `assets[].skin_weight_fbx` | Body/outfit meshes only. Replaces the GLB's corrupted skin weights — see `_transplant_skin_weights_from_fbx`. Missing/absent is non-fatal (falls back to GLB weights + renormalize), so don't add this to the hard preconditions below. |
 | Stage 01 LSE FBX | `characters/<id>/01-glb/LS_arkit_full.fbx` | full | Mesh + skeleton + per-pose bone keyframes — the ARKit shape-key source |
 | Stage 01 pose list | `characters/<id>/01-glb/arkit_pose_names.json` | full | Maps frame N → ARKit pose name |
 | Stage 01 textures | `characters/<id>/01-glb/textures/*.png` | hair / brow / lash atlases | Wired onto reconstructed groom materials |
@@ -77,21 +78,33 @@ fix or retroactively mark other stages' status.
      propagation on name-collision bones rather than just staying
      separate. Any armature that isn't a clean subset is left alone and
      logged loudly.
-   - Renormalize skin weights (`_renormalize_skin_weights`): UE's
-     GLTFExporter (stage 01) caps every vertex at 4 joint influences and
-     does NOT rescale the ones it keeps, so a vertex that genuinely needs
-     5+ influences (common on outfit neck/collar/shoulder seams, where
-     clavicle + neck + spine_04 all blend at once — confirmed by reading
-     the raw stage 01 GLB directly: whole outfit primitives had mean
-     weight-sum 0.18-0.40, vs. ~1.0 on the body mesh) arrives critically
-     under-weighted. Since Blender's Armature modifier applies vertex-
-     group weights as literal coefficients (no auto-normalize), an under-
-     summed vertex barely moves when posed while its fully-weighted
-     neighbor across the seam moves normally — tearing the mesh apart.
-     This can't recover the dropped 5th+ influence, but rescaling the
-     surviving 4 back to summing to 1.0 removes the near-frozen-vertex
-     failure mode. Runs after the armature merge (bone-name lookups need
-     each mesh's final Armature modifier target).
+   - Transplant skin weights from FBX (`_transplant_skin_weights_from_fbx`):
+     UE's GLTFExporter (stage 01) doesn't just cap body/outfit meshes at
+     4 joint influences — it corrupts the weights outright. Confirmed by
+     directly inspecting the raw stage 01 GLB: weight sums as low as 0.2
+     (of 1.0), and same-position duplicate vertices on opposite sides of
+     a UV seam bound to entirely different bones — even though the same
+     SkeletalMesh deforms correctly in-engine (visually verified in UE's
+     Skeletal Mesh Editor). Stage 01 also exports a plain FBX per body/
+     outfit mesh (`mh_manifest.assets[].skin_weight_fbx`) using UE's FBX
+     skeletal export path, which doesn't have this bug. This step imports
+     that FBX, kdtree-matches its vertices to the GLB mesh's by position
+     (same technique as the ARKit shape-key bake below — the two
+     exporters produce different vertex orderings for the same
+     underlying mesh), and rebuilds the GLB mesh's vertex groups from the
+     FBX's weights, wholesale. Also recovers 5th+ bone influences the
+     GLB's 4-influence cap was always going to lose. Runs after the
+     armature merge (vertex groups need to land on each mesh's final
+     Armature modifier target) and before renormalization.
+   - Renormalize skin weights (`_renormalize_skin_weights`): safety net
+     for any mesh without an FBX transplant (currently just the face) or
+     any transplanted vertex FBX itself left slightly off from summing to
+     1.0. Since Blender's Armature modifier applies vertex-group weights
+     as literal coefficients (no auto-normalize), an under-summed vertex
+     barely moves when posed while a fully-weighted neighbor moves
+     normally — tearing the mesh apart at the seam between them. Runs
+     after the armature merge (bone-name lookups need each mesh's final
+     Armature modifier target).
    - Bake 51 ARKit shape keys onto the face mesh via
      `_bake_arkit_from_lse_fbx`: import LSE FBX, scrub frame N for pose N
      (1:1 mapping at 24fps bake), capture deformed mesh via

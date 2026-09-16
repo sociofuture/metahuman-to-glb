@@ -740,11 +740,12 @@ def main():
     # incompleteness from any downstream check that lists the dir.
     # Manifest is the single source of truth for what was exported.
     import glob as _glob
-    for stale in _glob.glob(os.path.join(out_dir, "*.glb")):
-        try:
-            os.remove(stale)
-        except Exception as e:
-            _log(f"  could not remove stale {stale}: {e}")
+    for pattern in ("*.glb", "*.skinweights.fbx"):
+        for stale in _glob.glob(os.path.join(out_dir, pattern)):
+            try:
+                os.remove(stale)
+            except Exception as e:
+                _log(f"  could not remove stale {stale}: {e}")
 
     # SkeletalMeshes — body, face, outfits
     skm = _list_under(mh_folder, "SkeletalMesh")
@@ -786,17 +787,41 @@ def main():
         name = asset.get_name()
         rel = f"{name}.glb"
         abs_path = os.path.join(out_dir, rel)
+        role = _infer_role(asset)
         try:
             _export_one(asset, abs_path, opts)
             sz = os.path.getsize(abs_path)
             _log(f"  + {rel}  ({sz/1_000_000:.1f} MB)")
-            manifest_records.append({
+            record = {
                 "asset_path": asset.get_path_name(),
                 "file_path": rel,
                 "size_bytes": sz,
                 "mesh_type": type(asset).__name__,
-                "role": _infer_role(asset),
-            })
+                "role": role,
+            }
+            # GLTFExporter's own skin-weight export is unreliable on
+            # body/outfit SkeletalMeshes: confirmed by direct inspection
+            # (vertex position + weight comparison against the live
+            # SkeletalMesh's own bind pose) that some vertices land with
+            # weight sums as low as 0.2 and neighboring same-position
+            # vertices bound to entirely different bones, even though
+            # the mesh deforms correctly in-engine. UE's FBX skeletal
+            # export path is far more battle-tested for skin weights, so
+            # stage 02 sources the SKIN WEIGHTS (only) for these meshes
+            # from a parallel FBX export and transplants them onto the
+            # GLB geometry by kdtree position match — the same pattern
+            # already used for the face's ARKit shape keys via the LSE
+            # FBX (see _bake_arkit_from_lse_fbx in stage 02).
+            if role in ("body", "outfit"):
+                fbx_rel = f"{name}.skinweights.fbx"
+                fbx_abs = os.path.join(out_dir, fbx_rel)
+                try:
+                    _run_fbx_export_task(asset, fbx_abs, is_skeletal=True)
+                    record["skin_weight_fbx"] = fbx_rel
+                except Exception as e:
+                    warnings.append(f"{name}: skin-weight FBX export failed: {e}")
+                    _log(f"  ERROR {name} skin-weight FBX: {e}")
+            manifest_records.append(record)
         except Exception as e:
             warnings.append(f"{name}: {e}")
             _log(f"  ERROR {name}: {e}")

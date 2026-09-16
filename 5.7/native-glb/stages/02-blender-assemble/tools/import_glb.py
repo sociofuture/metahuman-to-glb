@@ -295,6 +295,116 @@ def _renormalize_skin_weights():
     return fixed_meshes, fixed_verts
 
 
+def _transplant_skin_weights_from_fbx(in_root, mh_manifest, asset_mesh_objs):
+    """Replace GLB-imported skin weights on body/outfit meshes with
+    weights read from stage 01's parallel FBX export.
+
+    UE's GLTFExporter corrupts skin weights on these meshes — confirmed
+    by directly inspecting the raw stage 01 GLB: weight sums as low as
+    0.2 (of 1.0), and same-position duplicate vertices on opposite sides
+    of a UV seam bound to entirely different bones — even though the
+    same SkeletalMesh deforms correctly in-engine (verified visually in
+    UE's Skeletal Mesh Editor). UE's FBX skeletal export path doesn't
+    have this problem, so we source the weights from there instead,
+    matching FBX vertices to GLB vertices by kdtree position (same
+    technique already used for the face's ARKit shape-key bake, since
+    the two exporters produce different vertex orderings for the same
+    underlying mesh). This also recovers 5th+ bone influences the GLB's
+    4-influence cap was always going to lose, since FBX carries every
+    influence UE actually painted.
+
+    Wipes each target mesh's vertex groups outright and rebuilds them
+    from the FBX data rather than clearing per-vertex — these meshes
+    only ever carry bone-deform groups, so this is safe and avoids an
+    O(verts x groups) per-vertex clear.
+    """
+    import mathutils.kdtree as _kdtree
+
+    fixed_meshes = 0
+    for rec in (mh_manifest or {}).get("assets", []):
+        fbx_rel = rec.get("skin_weight_fbx")
+        if not fbx_rel:
+            continue
+        tgt = asset_mesh_objs.get(rec["file_path"])
+        if tgt is None:
+            _log(f"  skin-weight transplant: no target mesh object for {rec['file_path']}")
+            continue
+        fbx_path = os.path.join(in_root, fbx_rel)
+        if not os.path.isfile(fbx_path):
+            _log(f"  skin-weight transplant: {fbx_path} missing")
+            continue
+
+        pre_objects = set(bpy.data.objects.keys())
+        bpy.ops.import_scene.fbx(filepath=fbx_path, use_anim=False)
+        new_objects = [bpy.data.objects[n] for n in set(bpy.data.objects.keys()) - pre_objects]
+        src_mesh = next((o for o in new_objects if o.type == "MESH"), None)
+        if src_mesh is None:
+            _log(f"  skin-weight transplant: FBX import for {fbx_rel} produced no mesh")
+            for o in new_objects:
+                bpy.data.objects.remove(o, do_unlink=True)
+            continue
+        if len(src_mesh.data.vertices) != len(tgt.data.vertices):
+            _log(f"  skin-weight transplant: SKIP {tgt.name} — vertex count "
+                 f"mismatch (fbx={len(src_mesh.data.vertices)} "
+                 f"glb={len(tgt.data.vertices)}), can't trust a position match")
+            for o in new_objects:
+                bpy.data.objects.remove(o, do_unlink=True)
+            continue
+
+        # FBX import lands mesh-local positions in cm (the cm->m scale is
+        # applied at the object level, not baked into vertex coords); GLB
+        # import is already metres. Normalize both to metres, centroid-
+        # aligned — identical to the ARKit kdtree match in
+        # _bake_arkit_from_lse_fbx.
+        SRC_LOCAL_TO_M = 0.01
+        TGT_LOCAL_TO_M = 1.0
+        src_pos = [v.co * SRC_LOCAL_TO_M for v in src_mesh.data.vertices]
+        tgt_pos = [v.co * TGT_LOCAL_TO_M for v in tgt.data.vertices]
+        src_centroid = sum(src_pos, src_pos[0] * 0) / max(len(src_pos), 1)
+        tgt_centroid = sum(tgt_pos, tgt_pos[0] * 0) / max(len(tgt_pos), 1)
+
+        tree = _kdtree.KDTree(len(src_pos))
+        for i, p in enumerate(src_pos):
+            tree.insert(p - src_centroid, i)
+        tree.balance()
+
+        max_d = 0.0
+        sum_d = 0.0
+        tgt_to_src = [0] * len(tgt_pos)
+        for i, p in enumerate(tgt_pos):
+            _, idx, d = tree.find(p - tgt_centroid)
+            tgt_to_src[i] = idx
+            sum_d += d
+            if d > max_d:
+                max_d = d
+        avg_d = sum_d / len(tgt_pos) if tgt_pos else 0.0
+        _log(f"  skin-weight transplant: {tgt.name} <- {fbx_rel} "
+             f"kdtree match max={max_d*1000:.2f}mm avg={avg_d*1000:.2f}mm")
+
+        src_group_names = [vg.name for vg in src_mesh.vertex_groups]
+        src_vertex_weights = [
+            [(src_group_names[ge.group], ge.weight) for ge in v.groups if ge.weight > 1e-4]
+            for v in src_mesh.data.vertices
+        ]
+
+        for vg in list(tgt.vertex_groups):
+            tgt.vertex_groups.remove(vg)
+        tgt_group_by_name = {}
+        for v in tgt.data.vertices:
+            for bone_name, weight in src_vertex_weights[tgt_to_src[v.index]]:
+                vg = tgt_group_by_name.get(bone_name)
+                if vg is None:
+                    vg = tgt.vertex_groups.new(name=bone_name)
+                    tgt_group_by_name[bone_name] = vg
+                vg.add([v.index], weight, "REPLACE")
+
+        for o in new_objects:
+            bpy.data.objects.remove(o, do_unlink=True)
+        fixed_meshes += 1
+
+    return fixed_meshes
+
+
 def _hair_white_amount(mi_params):
     """MH's `WhiteAmount` scalar (0..1 fraction of graying/white hair) on
     the groom MI. The viewer applies this per-strand (using the Attribute
@@ -2119,10 +2229,26 @@ def main():
     _reset_scene()
 
     hair_names = set()
+    # Track which MESH object each manifest record's GLB import produced,
+    # by diffing bpy.data.objects before/after each import call. Needed
+    # by _transplant_skin_weights_from_fbx to find the right target mesh
+    # for each body/outfit record without guessing Blender's dedup-suffix
+    # naming convention.
+    asset_mesh_objs = {}
     for rec in mh["assets"]:
         glb = os.path.join(in_root, rec["file_path"])
         _log(f"importing {glb}")
+        pre_objs = set(bpy.data.objects.keys())
         _import_glb(glb)
+        new_objs = [bpy.data.objects[n] for n in set(bpy.data.objects.keys()) - pre_objs]
+        # A single GLB can spawn multiple new MESH objects: the real
+        # mesh plus glTF-importer "Icosphere" placeholders for empty
+        # nodes (bone sockets etc — see _remove_gltf_placeholder_empties).
+        # Pick the one with the most vertices, not just the first.
+        new_meshes = [o for o in new_objs if o.type == "MESH"]
+        mesh_obj = max(new_meshes, key=lambda o: len(o.data.vertices), default=None)
+        if mesh_obj is not None:
+            asset_mesh_objs[rec["file_path"]] = mesh_obj
         if rec.get("role") == "hair":
             hair_names.add(rec["file_path"].lower().replace(".glb", ""))
 
@@ -2139,6 +2265,16 @@ def main():
     merged_arms = _merge_armatures()
     if merged_arms:
         _log(f"merged {merged_arms} duplicate armature(s) into one skeleton")
+
+    # See _transplant_skin_weights_from_fbx() docstring: UE's GLTFExporter
+    # corrupts skin weights on body/outfit meshes. Replace them with
+    # weights read from stage 01's parallel FBX export before anything
+    # downstream (renormalize, export) trusts the GLB-derived weights.
+    # Must run after the armature merge so vertex groups land on each
+    # mesh's now-final (canonical) Armature modifier target.
+    transplanted = _transplant_skin_weights_from_fbx(in_root, mh, asset_mesh_objs)
+    if transplanted:
+        _log(f"transplanted skin weights from FBX onto {transplanted} mesh(es)")
 
     # See _renormalize_skin_weights() docstring: UE's GLTFExporter drops
     # any influence beyond the 4th per vertex without rescaling the ones
