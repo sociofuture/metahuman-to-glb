@@ -9,15 +9,24 @@
 //       eye_refractive — iris atlas sampling around mesh pole UV + limbus
 //                        darkening + radial iris/sclera + pupil ramp + veins
 //       face_accessory — flat defaults (teeth/saliva/eyelashes/occlusion/cartilage)
-//       skin   — passthrough (glTF carries the textures already)
+//       skin   — glTF carries the base textures already; viewer.js layers a
+//                cheap fake-SSS (transmission/thickness/attenuation*) on top
+//                (see applySkin)
 
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 
 const DRACO_DECODER = 'https://www.gstatic.com/draco/versioned/decoders/1.5.7/';
+// Shared HDRI, one level up from every docs/characters/<id>/ page (same
+// relative-path pattern as ../../assets/style.css). Used as both the visible
+// background and the IBL environment when it loads successfully; falls back
+// to the flat color + synthetic RoomEnvironment below if it 404s or errors,
+// so a missing/renamed file never breaks the viewer.
+const DEFAULT_HDRI = '../../assets/debris_basement_corridor_4k.hdr';
 
 // Per-character hair-param overrides, layered on top of the shared hair
 // defaults in applyHair / addHairInnerPass. Values dialled in via ?tune=1
@@ -89,6 +98,7 @@ export async function mount(container, opts) {
     autoRotate = false,
     interactive = true,
     background = 0x0b0d11,
+    hdriUrl = DEFAULT_HDRI,
   } = opts;
 
   const w = container.clientWidth || 640;
@@ -124,6 +134,18 @@ export async function mount(container, opts) {
   keyLight.position.set(1.3, 1.6, 2.0);
   scene.add(keyLight);
 
+  // Rim/back light: without this, the skin's fake-SSS (transmission/
+  // thickness — see applySkin) never reads at all. That effect only shows
+  // where light passes THROUGH the material from behind (ear rim, thin
+  // jaw silhouette against the light) — confirmed by testing transmission
+  // 0 vs 0.6 under key-light-only lighting: visually identical either way.
+  // Positioned behind and opposite the key light for classic contre-jour
+  // separation; cool-tinted so it reads as a distinct light source against
+  // the warm key rather than just "more front light".
+  const rimLight = new THREE.DirectionalLight(0xdce8ff, 1.6);
+  rimLight.position.set(-1.0, 1.3, -2.2);
+  scene.add(rimLight);
+
   const controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
@@ -138,11 +160,32 @@ export async function mount(container, opts) {
   const loader = new GLTFLoader();
   loader.setDRACOLoader(draco);
 
-  const [gltf, mapping] = await Promise.all([
+  // HDRI background/environment loads in parallel with the GLB. The
+  // synchronous RoomEnvironment set above is the fallback: if the HDRI is
+  // missing/renamed/fails to parse, the catch below just leaves it in
+  // place — the viewer never blocks on or breaks because of this file.
+  const hdriPromise = hdriUrl
+    ? new RGBELoader().loadAsync(hdriUrl).catch((err) => {
+        console.warn('[viewer] HDRI load failed, keeping RoomEnvironment:', err);
+        return null;
+      })
+    : Promise.resolve(null);
+
+  const [gltf, mapping, hdrTex] = await Promise.all([
     loader.loadAsync(glbUrl),
     mappingUrl ? fetch(mappingUrl).then((r) => (r.ok ? r.json() : null)).catch(() => null)
                : Promise.resolve(null),
+    hdriPromise,
   ]);
+
+  if (hdrTex) {
+    hdrTex.mapping = THREE.EquirectangularReflectionMapping;
+    // environment: PMREM-prefiltered (correct roughness-based mip lookups
+    // for reflections). background: the raw equirect, sharp — do NOT
+    // dispose this one, it stays live as scene.background.
+    scene.environment = pmrem.fromEquirectangular(hdrTex).texture;
+    scene.background = hdrTex;
+  }
 
   scene.add(gltf.scene);
 
@@ -183,22 +226,27 @@ export async function mount(container, opts) {
   }
 
   let hairMats = [];
+  let skinMats = [];
   if (mapping) {
     try {
       const ctx = patchMaterials(gltf.scene, mapping, new URL(mappingUrl, window.location.href));
       hairMats = ctx?.hairMats || [];
+      skinMats = ctx?.skinMats || [];
     } catch (err) {
       console.warn('[viewer] material patch failed:', err);
     }
   }
 
-  // Hair live-tuning panel: off by default; opts.tune === true or ?tune=1 in
-  // the URL enables it. Sliders write directly to shader uniforms / material
-  // props, so no rebuild needed when dialling.
+  // Hair / skin live-tuning panels: off by default; opts.tune === true or
+  // ?tune=1 in the URL enables them. Sliders write directly to shader
+  // uniforms / material props, so no rebuild needed when dialling.
   const tuneOn = opts.tune === true ||
                  (typeof window !== 'undefined' && /[?&]tune=1/.test(window.location.search));
   if (tuneOn && hairMats.length > 0) {
     buildHairTunePanel(container, hairMats);
+  }
+  if (tuneOn && skinMats.length > 0) {
+    buildSkinTunePanel(container, skinMats);
   }
 
   // Blendshape sliders: enable on interactive viewers so users can exercise
@@ -299,10 +347,64 @@ function autoFrame(camera, controls, obj) {
 //   sheen            = 0.00
 //   envMapIntensity  = 1.00   (default, left alone)
 //   exposure         = 1.00   (default, left alone on renderer)
+//
+// Cheap fake-SSS (KHR_materials_transmission/volume via MeshPhysicalMaterial):
+// no per-pixel thickness map exists on the UE side (checked — MetaHuman's
+// skin SSS is profile-based, driven by an engine-internal LUT, not a
+// texture; the "Scatter Baked" map that looked promising turned out to be
+// a low-contrast fake-SSS detail mask, not a thickness map — confirmed by
+// sampling it: ears read the same as cheeks/forehead, which a real
+// thickness map would not). A UNIFORM thickness value can't reproduce
+// ears/nose/lips scattering more than forehead/jaw the way a real
+// thickness map would — this is a flat approximation, not true regional
+// SSS. transmission/thickness/attenuation* dialled in via the live panel
+// (?tune=1) then frozen here.
+//   transmission        = 0.03  (yes, this low — see note below)
+//   thickness           = 1.00  (NOT metres despite being a "thickness" —
+//                                three.js's Beer-Lambert absorption only
+//                                depends on the thickness/attenuationDistance
+//                                RATIO, not on either value alone. Don't be
+//                                misled by the small on-screen scale of the
+//                                model.
+//   attenuationColor     = (1.0, 0.55, 0.45)  (warm skin-tone bleed)
+//   attenuationDistance = 1.00  (see below — NOT 0.02; that was a bug)
+//
+// attenuationDistance was originally 0.02, chosen to "match" thickness's
+// metre-scaled GLB world units. That was wrong: Beer-Lambert absorption is
+// exp(-thickness/attenuationDistance), so a 0.02 attenuationDistance means
+// ANY thickness above ~0.1 is already fully absorbed (ratio > 5) — the
+// entire visible transition from "no effect" to "fully saturated" was
+// compressed into the bottom 2% of the tune panel's 0-5 thickness slider,
+// which is exactly why it looked like a binary switch (0 = raw bright
+// transmission showing through; anything else = the same fully-saturated
+// attenuationColor tint, no visible gradient in between) instead of a
+// smooth dial. It also made bright backgrounds (e.g. a bright patch of the
+// HDRI directly behind the head) blow out to a solid saturated
+// attenuationColor wash, because "fully saturated" was the ONLY reachable
+// state above thickness~0.1. Raising attenuationDistance to 1.0 spreads
+// the transition across the panel's whole thickness range and keeps the
+// result stable (no red blowout) even against a bright HDRI background —
+// confirmed by testing thickness 0/0.2/0.5/1.0/3.0 against the HDRI's
+// brightest angle: 0 shows raw (bright/white) transmission, then a smooth
+// gradual warm tint through to ~2-3, with no discontinuity and no blowout.
+//
+// transmission also had to come down separately, from 0.20 to 0.03. Even
+// after the attenuationDistance fix above (no more hard blowout), 0.20 at
+// a near-grazing profile angle against a bright HDRI patch still washed
+// the whole cheek/jaw into a flat solid orange with skin texture/pores
+// barely visible — transmission directly scales how much of that
+// background shows through at all, independent of the thickness/
+// attenuation tuning. 0.03 keeps skin texture visible at every angle
+// tested (front, profile, grazing-against-bright-HDRI) while still
+// showing a subtle warm rim on the ear against the permanent rim light.
 function applySkin(mat) {
   if ('metalness' in mat)          mat.metalness = 0;
   if ('roughness' in mat)          mat.roughness = 1.0;
   if ('specularIntensity' in mat)  mat.specularIntensity = 0.65;
+  if ('transmission' in mat)       mat.transmission = 0.03;
+  if ('thickness' in mat)          mat.thickness = 1.00;
+  if ('attenuationColor' in mat)   mat.attenuationColor.setRGB(1.0, 0.55, 0.45);
+  if ('attenuationDistance' in mat) mat.attenuationDistance = 1.00;
   // Inject roughness-floor override: roughnessMap's scalar multiplier can only
   // darken below the baked value — `uRoughMin` clamps roughness up to a floor
   // so the baked-in oily hotspots on forehead/nose blur into matte.
@@ -353,13 +455,54 @@ function patchMaterials(root, mapping, baseUrl) {
   // outer translucent alpha-blend). Collect candidates in the traverse and
   // clone them after, so we don't mutate the scene graph while walking it.
   const hairTwoPass = [];
+  const skinMats = [];
   root.traverse((obj) => {
     if (!obj.isMesh) return;
     const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
     materials.forEach((mat, i) => {
       if (!mat?.name) return;
       const spec = specByName.get(mat.name);
-      if (!spec) { counts.skipped += 1; return; }
+      if (!spec) {
+        // Skin materials never get an mh_materials.json entry — stage 02
+        // rebuilds their whole node graph in Blender and bakes the result
+        // straight into the glTF material (see applySkin's comment: "glTF
+        // carries the textures already"), so there's nothing for the JSON
+        // spec system to describe. Detect them here by name instead, same
+        // pattern stage 01/02 use ("face_skin_baked"+"lod0" / "body_baked").
+        const lname = mat.name.toLowerCase();
+        const isSkin = (lname.includes('face_skin_baked') && lname.includes('lod0'))
+                     || lname.includes('body_baked');
+        if (isSkin) {
+          let workMat = mat;
+          if (!workMat.isMeshPhysicalMaterial && workMat.isMeshStandardMaterial) {
+            // Not phys.copy(workMat): MeshPhysicalMaterial.copy() reaches for
+            // Physical-only Vector2 props (e.g. clearcoatNormalScale) that
+            // don't exist on a plain glTF-imported MeshStandardMaterial and
+            // throws ("Cannot read properties of undefined (reading 'x')").
+            // Copy only what skin actually needs.
+            const phys = new THREE.MeshPhysicalMaterial({
+              name: workMat.name,
+              map: workMat.map || null,
+              normalMap: workMat.normalMap || null,
+              normalScale: workMat.normalScale ? workMat.normalScale.clone() : undefined,
+              color: workMat.color ? workMat.color.clone() : undefined,
+              roughness: workMat.roughness,
+              metalness: workMat.metalness,
+              side: workMat.side,
+            });
+            workMat = phys;
+            if (Array.isArray(obj.material)) obj.material[i] = phys;
+            else obj.material = phys;
+          }
+          applySkin(workMat);
+          skinMats.push(workMat);
+          counts.matched += 1;
+          counts.byKind.skin = (counts.byKind.skin || 0) + 1;
+        } else {
+          counts.skipped += 1;
+        }
+        return;
+      }
       counts.matched += 1;
       const key = spec.face_slot ? `${spec.kind}:${spec.face_slot}` : spec.kind;
       counts.byKind[key] = (counts.byKind[key] || 0) + 1;
@@ -390,6 +533,7 @@ function patchMaterials(root, mapping, baseUrl) {
       }
       if (spec.kind === 'skin') {
         applySkin(patched || workMat);
+        skinMats.push(patched || workMat);
       }
     });
   });
@@ -457,7 +601,7 @@ function patchMaterials(root, mapping, baseUrl) {
   });
   console.log('[viewer] patched', counts.matched, 'matched /', counts.skipped,
               'skipped', counts.byKind, '/ hair two-pass:', hairTwoPass.length);
-  return { hairMats };
+  return { hairMats, skinMats };
 }
 
 function applySpec(mat, spec, loadTex) {
@@ -1173,6 +1317,116 @@ function buildHairTunePanel(container, hairMats) {
       setTimeout(() => { saveBtn.textContent = 'copy JSON'; }, 1500);
     }).catch(() => {
       console.log('[hair settings]', json);
+      saveBtn.textContent = 'logged to console';
+      setTimeout(() => { saveBtn.textContent = 'copy JSON'; }, 1500);
+    });
+  });
+  body.appendChild(saveBtn);
+
+  container.appendChild(root);
+}
+
+// ---------------- skin (fake-SSS transmission tuning)
+
+// Cheap fake-SSS via MeshPhysicalMaterial's transmission/thickness/
+// attenuation* (KHR_materials_transmission + KHR_materials_volume). No
+// per-pixel thickness map — see applySkin's comment for why (UE's
+// MetaHuman skin SSS is profile-based, not texture-based; nothing to
+// extract). A single uniform thickness can't give ears/nose/lips more
+// scattering than the forehead the way a real thickness map would; this
+// panel is for dialling in a flat approximation that still reads OK at a
+// glance, not true regional subsurface scattering.
+function buildSkinTunePanel(container, skinMats) {
+  container.style.position = container.style.position || 'relative';
+
+  const root = document.createElement('div');
+  root.style.cssText = [
+    'position:absolute', 'top:8px', 'right:170px', 'z-index:10',
+    'font:12px/1.3 system-ui,-apple-system,sans-serif', 'color:#e8e8e8',
+    'background:rgba(18,20,26,0.88)', 'border:1px solid #2a2f3a',
+    'border-radius:6px', 'user-select:none', 'backdrop-filter:blur(6px)',
+    'max-height:90vh', 'overflow-y:auto',
+  ].join(';');
+
+  const header = document.createElement('div');
+  header.textContent = 'skin sss ▾';
+  header.style.cssText = 'padding:6px 10px;cursor:pointer;font-weight:600;letter-spacing:0.04em';
+  root.appendChild(header);
+
+  const body = document.createElement('div');
+  body.style.cssText = 'padding:4px 10px 10px;display:none;min-width:240px';
+  root.appendChild(body);
+
+  header.addEventListener('click', () => {
+    const open = body.style.display === 'none';
+    body.style.display = open ? 'block' : 'none';
+    header.textContent = open ? 'skin sss ▴' : 'skin sss ▾';
+  });
+
+  const addSlider = (parent, label, min, max, step, initial, onChange) => {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:grid;grid-template-columns:90px 1fr 44px;gap:6px;align-items:center;margin:4px 0';
+    const l = document.createElement('span'); l.textContent = label;
+    const input = document.createElement('input');
+    input.type = 'range';
+    input.min = String(min); input.max = String(max); input.step = String(step);
+    input.value = String(initial);
+    input.style.cssText = 'width:100%;accent-color:#7ab8ff';
+    const val = document.createElement('span');
+    val.style.cssText = 'text-align:right;font-variant-numeric:tabular-nums;color:#aab';
+    const fmt = (x) => (Math.abs(x) < 10 ? x.toFixed(3) : x.toFixed(1));
+    val.textContent = fmt(Number(initial));
+    input.addEventListener('input', () => {
+      const v = Number(input.value);
+      val.textContent = fmt(v);
+      onChange(v);
+    });
+    row.appendChild(l); row.appendChild(input); row.appendChild(val);
+    parent.appendChild(row);
+  };
+
+  const first = skinMats[0];
+  const setPropAll = (key, v) => { for (const m of skinMats) { if (key in m) m[key] = v; } };
+  const setAttenColorChannel = (idx, v) => {
+    for (const m of skinMats) {
+      if (!m.attenuationColor) continue;
+      if (idx === 0) m.attenuationColor.r = v;
+      if (idx === 1) m.attenuationColor.g = v;
+      if (idx === 2) m.attenuationColor.b = v;
+    }
+  };
+
+  addSlider(body, 'transmission', 0.0, 1.0, 0.01, first?.transmission ?? 0.2,
+            (v) => setPropAll('transmission', v));
+  addSlider(body, 'thickness', 0.0, 5.0, 0.01, first?.thickness ?? 1.0,
+            (v) => setPropAll('thickness', v));
+  addSlider(body, 'atten dist', 0.05, 3.0, 0.01, first?.attenuationDistance ?? 1.0,
+            (v) => setPropAll('attenuationDistance', v));
+  addSlider(body, 'atten R', 0.0, 1.0, 0.01, first?.attenuationColor?.r ?? 1.0,
+            (v) => setAttenColorChannel(0, v));
+  addSlider(body, 'atten G', 0.0, 1.0, 0.01, first?.attenuationColor?.g ?? 0.55,
+            (v) => setAttenColorChannel(1, v));
+  addSlider(body, 'atten B', 0.0, 1.0, 0.01, first?.attenuationColor?.b ?? 0.45,
+            (v) => setAttenColorChannel(2, v));
+  addSlider(body, 'ior', 1.0, 2.0, 0.01, first?.ior ?? 1.5,
+            (v) => setPropAll('ior', v));
+
+  const saveBtn = document.createElement('button');
+  saveBtn.textContent = 'copy JSON';
+  saveBtn.style.cssText = 'margin-top:8px;padding:4px 8px;background:#2a2f3a;color:#e8e8e8;border:1px solid #444;border-radius:4px;cursor:pointer;font:inherit';
+  saveBtn.addEventListener('click', () => {
+    const json = JSON.stringify({
+      transmission: first?.transmission,
+      thickness: first?.thickness,
+      attenuationDistance: first?.attenuationDistance,
+      attenuationColor: first?.attenuationColor ? [first.attenuationColor.r, first.attenuationColor.g, first.attenuationColor.b] : null,
+      ior: first?.ior,
+    }, null, 2);
+    navigator.clipboard.writeText(json).then(() => {
+      saveBtn.textContent = 'copied!';
+      setTimeout(() => { saveBtn.textContent = 'copy JSON'; }, 1500);
+    }).catch(() => {
+      console.log('[skin sss settings]', json);
       saveBtn.textContent = 'logged to console';
       setTimeout(() => { saveBtn.textContent = 'copy JSON'; }, 1500);
     });

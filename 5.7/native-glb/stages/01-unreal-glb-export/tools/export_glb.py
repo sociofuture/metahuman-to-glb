@@ -730,6 +730,15 @@ def main():
     mh_folder = char_manifest.get("ue_content_root") or char_manifest["mh_folder"]
     _log(f"content root: {mh_folder}")
 
+    # Only outfits / grooms WORN in MetaHuman Creator (hanger mark) go
+    # into the GLB - see _worn_asset_names for what else sits in the
+    # content root.
+    worn = _worn_asset_names(mh_folder)
+    _log(f"worn assets: {sorted(worn) if worn is not None else None}")
+
+    def _is_worn(name):
+        return worn is None or name in worn
+
     out_dir = _ensure_dir(os.path.join(char_root, "01-glb"))
     textures_dir = _ensure_dir(os.path.join(out_dir, "textures"))
 
@@ -764,6 +773,12 @@ def main():
             f"Both FaceMesh and BodyMesh are required for a MetaHuman. "
             f"Re-run stage 00 to refresh {mh_folder}, or check that the "
             f"MetaHuman build actually completed and emitted a body mesh.")
+    unworn = [a.get_name() for a in skm
+              if _infer_role(a) == "outfit" and not _is_worn(a.get_name())]
+    if unworn:
+        _log(f"skipping outfits not worn in MetaHuman Creator: {unworn}")
+        skm = [a for a in skm if a.get_name() not in unworn]
+        skm_names = [a.get_name() for a in skm]
 
     # StaticMeshes — groom card fallbacks under /Game/<Name>/Grooms/.
     # MH naming is inconsistent: Hair_*/Eyebrows_* use plural "CardsMesh"
@@ -776,18 +791,34 @@ def main():
         and "_LOD0" in m.get_name()
     ]
 
+    # Custom grooms: the Hair Card Generator names its mesh
+    # `<Groom>_LOD0` (the name typed in its dialog becomes the FOLDER),
+    # and it may live outside mh_folder, so the name filter above misses
+    # it. Take it from the GroomAsset's own Cards entry instead and
+    # export it under the MH name so stage 02 treats it like MH cards.
+    groom_cards = _groom_card_meshes(mh_folder, hair_cards)
+
+    skipped = sorted({_groom_style_of(m.get_name()) for m in hair_cards
+                      if not _is_worn(_groom_style_of(m.get_name()))})
+    hair_cards = [m for m in hair_cards if _is_worn(_groom_style_of(m.get_name()))]
+    groom_cards = [(m, n) for m, n in groom_cards if _is_worn(_groom_style_of(n))]
+    if skipped:
+        _log(f"skipping grooms not worn in MetaHuman Creator: {skipped}")
+
     _log(f"found {len(skm)} SkeletalMesh(es) ({skm_names}) + "
-         f"{len(hair_cards)} hair-card StaticMesh(es)")
+         f"{len(hair_cards)} hair-card StaticMesh(es) + "
+         f"{len(groom_cards)} groom-referenced card mesh(es) "
+         f"({[n for _, n in groom_cards]})")
 
     opts = _make_gltf_options()
     manifest_records = []
     warnings = []
     seen_tex = set()  # de-dupe Texture2D exports across assets
-    for asset in skm + hair_cards:
-        name = asset.get_name()
+    export_list = [(a, a.get_name()) for a in skm + hair_cards] + groom_cards
+    for asset, name in export_list:
         rel = f"{name}.glb"
         abs_path = os.path.join(out_dir, rel)
-        role = _infer_role(asset)
+        role = _infer_role(asset) if name == asset.get_name() else "hair"
         try:
             _export_one(asset, abs_path, opts)
             sz = os.path.getsize(abs_path)
@@ -869,7 +900,7 @@ def main():
     groom_styles = []
     for a in groom_root_assets or []:
         cls = str(getattr(a, "asset_class_path", a).asset_name)
-        if cls == "GroomAsset":
+        if cls == "GroomAsset" and _is_worn(str(a.asset_name)):
             groom_styles.append(str(a.asset_name))
     _log(f"  sidecar: groom styles in {mh_folder}/Grooms: {groom_styles}")
 
@@ -914,6 +945,15 @@ def main():
                 f"{plugin_lashes_textures}/T_{style}_Coverage"
                 f".T_{style}_Coverage")
     for p in plugin_atlas_paths:
+        # Custom grooms have no plugin atlas (see the groom-cards fallback
+        # below). Check the registry first: load_asset on a missing path
+        # logs an Error, which alone makes UnrealEditor-Cmd exit 1.
+        try:
+            if not ar.get_asset_by_object_path(p).is_valid():
+                _log(f"    sidecar: no plugin atlas {p}")
+                continue
+        except Exception:
+            pass
         try:
             tex = unreal.EditorAssetLibrary.load_asset(p)
         except Exception as e:
@@ -938,6 +978,83 @@ def main():
         except Exception as e:
             _log(f"    sidecar PNG fail {tex_name}: {e}")
 
+    # Custom grooms (imported .abc + cards made with the Hair Card
+    # Generator plugin) have no plugin-content atlas, so the loop above
+    # finds nothing for them. Pull the atlases straight off the
+    # GroomAsset's LOD0 Cards entry instead and write them under the MH
+    # names (`<style>_CardsAtlas_{Attribute,Tangent}`) so stage 02 / the
+    # viewer treat them exactly like MH atlases. Only the "Card Compact"
+    # layout matches MH's packing (slot0 = Tangent|CoordU, slot1 =
+    # Coverage|Depth|Seed); anything else would feed the viewer the
+    # wrong channels, so fail loud with the fix instead.
+    exported_names = {r["name"] for r in sidecar_records}
+    card_mesh_names = ([m.get_name() for m in hair_cards]
+                       + [n for _, n in groom_cards])
+    for style in groom_styles:
+        if not style.startswith(tuple(p for p, _ in style_to_plugin)):
+            continue  # eyelashes / peachfuzz: no card mesh by design
+        if not any(n.startswith(style + "_Card") for n in card_mesh_names):
+            msg = (f"groom {style}: no hair-card mesh (neither a "
+                   f"'{style}_CardsMesh_*_LOD0' StaticMesh under "
+                   f"{mh_folder}/Grooms nor a LOD Index 0 Cards entry on the "
+                   f"groom) - it will be MISSING from the GLB. Generate hair "
+                   f"cards for it (Groom editor > Cards, LOD Index 0, "
+                   f"Textures > Layout 'Card Compact'), save, re-run stage 00.")
+            warnings.append(msg)
+            _log(f"  WARNING {msg}")
+            continue
+        if f"{style}_CardsAtlas_Attribute" in exported_names:
+            continue
+        groom = unreal.EditorAssetLibrary.load_asset(
+            f"{mh_folder}/Grooms/{style}.{style}")
+        if groom is None:
+            warnings.append(f"groom {style}: load failed - card atlas not exported")
+            continue
+        try:
+            cards = list(groom.get_editor_property("hair_groups_cards") or [])
+        except Exception as e:
+            warnings.append(f"groom {style}: cannot read Cards entries: {e}")
+            continue
+        lod0 = [c for c in cards if c.get_editor_property("lod_index") == 0]
+        if not lod0:
+            warnings.append(f"groom {style}: no Cards entry with LOD Index 0 "
+                            f"- card atlas not exported")
+            continue
+        tex_desc = lod0[0].get_editor_property("textures")
+        layout = tex_desc.get_editor_property("layout")
+        texs = list(tex_desc.get_editor_property("textures") or [])
+        if layout != unreal.HairTextureLayout.LAYOUT2 or len(texs) < 2:
+            msg = (f"groom {style}: Cards textures use layout {layout} "
+                   f"({len(texs)} texture(s)); the pipeline needs 'Card "
+                   f"Compact' (MH packing). Regenerate the cards with "
+                   f"Textures > Layout = Card Compact.")
+            warnings.append(msg)
+            _log(f"  WARNING {msg}")
+            continue
+        for slot, kind in ((1, "Attribute"), (0, "Tangent")):
+            tex = texs[slot]
+            if tex is None:
+                warnings.append(f"groom {style}: Cards texture slot {slot} "
+                                f"({kind}) is empty")
+                continue
+            stem = f"{style}_CardsAtlas_{kind}"
+            rel = f"textures/{stem}.png"
+            abs_path = os.path.join(textures_dir, f"{stem}.png")
+            try:
+                _export_texture_png(tex, abs_path)
+                sz = os.path.getsize(abs_path) if os.path.exists(abs_path) else 0
+                sidecar_records.append({
+                    "asset_path": tex.get_path_name(),
+                    "file_path": rel,
+                    "size_bytes": sz,
+                    "name": stem,
+                })
+                _log(f"    + groom cards: {rel} <- {tex.get_path_name()} "
+                     f"({sz/1024:.0f} KB)")
+            except Exception as e:
+                warnings.append(f"groom {style}: {kind} atlas export failed: {e}")
+                _log(f"    sidecar PNG fail {stem}: {e}")
+
     # MI parameter dump for groom materials. Hair-card meshes have no
     # albedo texture; their color comes from MI scalar/vector params
     # (hairMelanin, hairRedness, hairDye). Walk every MaterialInstance
@@ -951,7 +1068,10 @@ def main():
     groom_materials = {}
     for a in groom_mi_assets or []:
         cls = str(getattr(a, "asset_class_path", a).asset_name)
-        if "Material" not in cls:
+        # Worn grooms' MIs only: an unworn groom's MI (e.g. a ticked-but-
+        # unworn Hair_M_BobMessy) would otherwise be picked up by stage
+        # 02's "any mi_wi_hair_" color fallback.
+        if "Material" not in cls or not _is_worn(str(a.asset_name)):
             continue
         try:
             mi = a.get_asset()
@@ -970,6 +1090,40 @@ def main():
         }
         _log(f"    groom mi[{mi_name}]: vectors={list(params['vectors'])} "
              f"scalars={list(params['scalars'])}")
+
+    # Custom grooms get no MI_WI_* from the MH build: their material is
+    # whatever the operator assigned on the GroomAsset (e.g. an MI of
+    # M_hair_v4 carrying hairMelanin/hairRedness). Read that one and
+    # record it under the MH card-MI name so stage 02's per-style MI
+    # lookup finds it. The Cards entry's slot choice (MaterialSlotName)
+    # isn't exposed to Python, so: the only slot, else a "*cards*" slot,
+    # else the first.
+    for style in groom_styles:
+        if not style.startswith(tuple(p for p, _ in style_to_plugin)):
+            continue
+        if any(n.lower().startswith(f"mi_wi_{style.lower()}_") for n in groom_materials):
+            continue
+        groom = unreal.EditorAssetLibrary.load_asset(f"{mh_folder}/Grooms/{style}.{style}")
+        if groom is None:
+            continue
+        slots = [(str(s.get_editor_property("slot_name")), s.get_editor_property("material"))
+                 for s in groom.get_editor_property("hair_groups_materials")]
+        slots = [(n, m) for n, m in slots if m is not None]
+        if not slots:
+            warnings.append(f"groom {style}: no MI_WI_* and no material on the "
+                            f"GroomAsset - hair color falls back to the default")
+            continue
+        pick = (slots[0] if len(slots) == 1 else
+                next(((n, m) for n, m in slots if "cards" in n.lower()), slots[0]))
+        params = _read_mi_params(pick[1])
+        key = f"MI_WI_{style}_Hair_Cards"
+        groom_materials[key] = {
+            "asset_path": pick[1].get_path_name(),
+            "vectors": params["vectors"],
+            "scalars": params["scalars"],
+        }
+        _log(f"    groom mi[{key}] <- groom slot '{pick[0]}' "
+             f"{pick[1].get_path_name()}: scalars={params['scalars']}")
 
     for a in tex_assets:
         try:
@@ -1053,6 +1207,87 @@ def main():
         json.dump(mh_manifest, f, indent=2)
     _log(f"wrote {os.path.join(out_dir, 'mh_manifest.json')}  "
          f"({len(manifest_records)} assets, {len(warnings)} warnings)")
+
+
+def _worn_asset_names(mh_folder):
+    """Leaf names of the assets the assembled character Blueprint
+    (`<content root>/BP_<Name>`) references, e.g. {'wm2_Outfits',
+    'Hair_MBTest_tidy', 'Eyelashes_S_Thin', ...} — i.e. what is actually
+    WORN (the hanger mark in MetaHuman Creator).
+
+    The content root holds more than that: the build unpacks every
+    wardrobe item merely ticked in the character's collection (e.g. an
+    unworn Hair_M_BobMessy), and never deletes outputs of earlier builds
+    (e.g. a wm2_Outfits_2 from a since-removed outfit). The Blueprint is
+    rewritten by every build and wires up exactly the worn parts.
+    Returns None when no BP_* is found, so callers keep everything."""
+    ar = unreal.AssetRegistryHelpers.get_asset_registry()
+    try:
+        roots = ar.get_assets_by_path(mh_folder, recursive=False,
+                                      include_only_on_disk_assets=False) or []
+    except Exception:
+        roots = []
+    bps = [a for a in roots
+           if str(getattr(a, "asset_class_path", a).asset_name) == "Blueprint"
+           and str(a.asset_name).startswith("BP_")]
+    if len(bps) != 1:
+        _log(f"  worn assets: expected one BP_* in {mh_folder}, found "
+             f"{[str(a.asset_name) for a in bps]} - exporting everything")
+        return None
+    pkg = str(bps[0].package_name)
+    deps = ar.get_dependencies(pkg, unreal.AssetRegistryDependencyOptions()) or []
+    return {str(d).rsplit("/", 1)[-1] for d in deps}
+
+
+def _groom_style_of(name):
+    """`Hair_M_BobMessy_CardsMesh_Group0_LOD0` -> `Hair_M_BobMessy`."""
+    for tail in ("_CardsMesh_", "_CardMesh_", "_CardsAtlas_"):
+        if tail in name:
+            return name.split(tail)[0]
+    return name
+
+
+def _groom_card_meshes(mh_folder, hair_cards):
+    """Return [(StaticMesh, out_name)] for grooms under <mh_folder>/Grooms
+    whose LOD0 cards mesh the name filter didn't already pick up, taken
+    from the GroomAsset's Cards entries (LOD Index 0). out_name follows
+    MH naming, `<Groom>_CardsMesh_Group<N>_LOD0`, which is what stage 02
+    keys the head-bone parenting and card-material wiring on."""
+    ar = unreal.AssetRegistryHelpers.get_asset_registry()
+    try:
+        assets = ar.get_assets_by_path(mh_folder + "/Grooms", recursive=False,
+                                       include_only_on_disk_assets=False)
+    except Exception:
+        assets = []
+    have = {m.get_path_name() for m in hair_cards}
+    have_names = [m.get_name() for m in hair_cards]
+    out = []
+    for a in assets or []:
+        if str(getattr(a, "asset_class_path", a).asset_name) != "GroomAsset":
+            continue
+        style = str(a.asset_name)
+        if not style.startswith(("Hair_", "Eyebrows_", "Beard_", "Mustache_")):
+            continue  # eyelashes / peachfuzz: no card mesh by design
+        if any(n.startswith(style + "_Card") for n in have_names):
+            continue
+        groom = a.get_asset()
+        if groom is None:
+            continue
+        try:
+            cards = list(groom.get_editor_property("hair_groups_cards") or [])
+        except Exception as e:
+            _log(f"  groom {style}: cannot read Cards entries: {e}")
+            continue
+        for c in cards:
+            if c.get_editor_property("lod_index") != 0:
+                continue
+            mesh = c.get_editor_property("imported_mesh")
+            if mesh is None or mesh.get_path_name() in have:
+                continue
+            have.add(mesh.get_path_name())
+            group = c.get_editor_property("group_index")
+            out.append((mesh, f"{style}_CardsMesh_Group{group}_LOD0"))
+    return out
 
 
 def _infer_role(asset):

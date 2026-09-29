@@ -418,6 +418,18 @@ def _hair_white_amount(mi_params):
     return max(0.0, min(1.0, float(scalars.get("WhiteAmount", 0.0))))
 
 
+def _groom_style_prefix(name_low):
+    """Strip the trailing _CardsMesh_GroupN_LODN (hair/eyebrows) or
+    _CardMesh_GroupN_LODN (beard/mustache) from a lowercase card mesh /
+    material name to get the groom-style prefix (`hair_m_bobmessy`).
+    Splitting on _cardsmesh_ only would leave beard/mustache names
+    un-stripped and fail the MI / atlas match."""
+    for tail in ("_cardsmesh_", "_cardmesh_"):
+        if tail in name_low:
+            return name_low.split(tail)[0]
+    return name_low
+
+
 def _synth_hair_color(mi_params):
     """Compute MH hair-card pigment Base Color from the MI's scalar/
     vector params.
@@ -664,15 +676,7 @@ def _wire_card_materials(in_root, mh_manifest):
         For beard_m_muttonchops_*      -> MI_WI_Beard_M_MuttonChops_Hair.
         For mustache_s_horseshoe_*     -> MI_WI_Mustache_S_Horseshoe_Hair.
         """
-        # Strip the trailing _CardsMesh_GroupN_LODN (hair/eyebrows) or
-        # _CardMesh_GroupN_LODN (beard/mustache) to get the groom-style
-        # prefix. Splitting on _cardsmesh_ only would leave beard/
-        # mustache mesh names un-stripped and fail the MI match.
-        prefix = mesh_name_low
-        for tail in ("_cardsmesh_", "_cardmesh_"):
-            if tail in prefix:
-                prefix = prefix.split(tail)[0]
-                break
+        prefix = _groom_style_prefix(mesh_name_low)
         # Best match: MI_WI_<prefix>_*Cards (hair) or *Hair (brows/lashes)
         candidates = []
         for mi_name, params in groom_mis.items():
@@ -743,8 +747,15 @@ def _wire_card_materials(in_root, mh_manifest):
             # Attribute texture is what carries strand cutout (R) and
             # root-darkening (B). Each MH groom kind has its own
             # plugin-content folder; stage 01 exports atlases as
-            # `<Kind_Style>_CardsAtlas_Attribute.png`.
-            if name_low.startswith("hair_"):
+            # `<Kind_Style>_CardsAtlas_Attribute.png`. Prefer the atlas
+            # of this mesh's own style — with two hair grooms in the
+            # sidecar pool the generic `Hair_` prefix match below would
+            # hand every hair mesh whichever atlas happens to come first.
+            attr_name, attr_path = _find(
+                [f"{_groom_style_prefix(name_low)}_cardsatlas_attribute"])
+            if attr_path:
+                pass
+            elif name_low.startswith("hair_"):
                 attr_name, attr_path = _find(["Hair_"])
             elif name_low.startswith("eyebrows_"):
                 # Prefer the engine-plugin-sourced atlas (named
@@ -764,6 +775,13 @@ def _wire_card_materials(in_root, mh_manifest):
                 continue
 
             mi_name, mi_params = _pick_groom_mi(name_low)
+            if mi_params is None and name_low.startswith("hair_"):
+                # Custom groom without its own MI: use the character's
+                # MH hair color (same fallback as mh_materials.json's
+                # _hair_color_for("mi_wi_hair_")), not the synth default.
+                mi_name, mi_params = next(
+                    ((n, p) for n, p in groom_mis.items()
+                     if n.lower().startswith("mi_wi_hair_")), (None, None))
             color = _synth_hair_color(mi_params)
             _log(f"  wire {obj.name}: mi={mi_name} "
                  f"color=({color[0]:.3f}, {color[1]:.3f}, {color[2]:.3f}) "
@@ -984,6 +1002,8 @@ def _emit_material_spec(out_root, mh_manifest):
             # stage 04's viewer won't apply hair-shader injection to
             # them and they'll render with the GLTFExporter default.
             _default = ((0.18, 0.10, 0.05, 1.0), 0.0)
+            # Same own-style-first atlas lookup as _wire_card_materials.
+            own_stem = _find_stem([f"{_groom_style_prefix(ml)}_cardsatlas_attribute"])
             if ml.startswith("hair_"):
                 stem = _find_stem(["Hair_S_Coil_CardsAtlas_Attribute",
                                    "Hair_"])
@@ -1000,6 +1020,7 @@ def _emit_material_spec(out_root, mh_manifest):
                 color, white_amount = _hair_color_for("mi_wi_mustache_") or _default
             else:
                 continue
+            stem = own_stem or stem
             if stem is None:
                 continue
             materials.append({
@@ -2249,6 +2270,17 @@ def main():
         mesh_obj = max(new_meshes, key=lambda o: len(o.data.vertices), default=None)
         if mesh_obj is not None:
             asset_mesh_objs[rec["file_path"]] = mesh_obj
+        if rec.get("role") == "hair" and mesh_obj is not None:
+            # Stage 01 names hair GLBs `<Groom>_CardsMesh_GroupN_LOD0`,
+            # but the object inside carries the StaticMesh asset name,
+            # which for Hair Card Generator output is just `<Groom>_LOD0`.
+            # Everything below (parenting, card-material wiring) keys on
+            # the MH name, so adopt the file stem.
+            stem = os.path.splitext(os.path.basename(rec["file_path"]))[0]
+            if not mesh_obj.name.lower().startswith(stem.lower()):
+                _log(f"  rename hair object {mesh_obj.name} -> {stem}")
+                mesh_obj.name = stem
+                mesh_obj.data.name = stem
         if rec.get("role") == "hair":
             hair_names.add(rec["file_path"].lower().replace(".glb", ""))
 
